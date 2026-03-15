@@ -40,23 +40,63 @@ tests/              # pytest tests for core library
 ### Architecture
 
 - Registered via `on_ui_tabs` in `!adetailer.py` → returns `(tab, "ADetailer+", "adetailer_advanced")`
-- Two-tab layout: **Detection** (model select + input gallery) → **Inpainting** (settings + per-detection accordions + preview/output)
-- Auto-switches tabs after detect (→ Inpainting) and process (→ Output sub-tab)
+- Two-tab layout: **Detection** (model select + input gallery + selection panel) → **Inpainting** (settings + per-pass accordions + output)
+- **Pass-based workflow**: Detection → Selection → Confirm → Inpainting → Process
+
+### Workflow
+
+1. **Detect**: Run models → preview with bounding boxes, selection panel appears
+2. **Select**: CheckboxGroup shows all detections; user checks items + clicks "Add Pass" to group them into an inpaint pass (repeat for multiple passes)
+3. **Confirm**: Masks within each pass are union-merged; accordions are populated on the Inpainting tab (one per pass)
+4. **Process**: Each pass is inpainted sequentially with its merged mask
 
 ### Key Constants
 
-- `MAX_DETECTIONS = 8` — maximum simultaneous detections per image
+- `MAX_DETECTIONS = 8` — maximum raw detections per image
+- `MAX_PASSES = 8` — maximum inpaint passes (each gets one accordion)
+
+### Pass State
+
+`passes_state` (a `gr.State`) holds a list of dicts:
+```python
+[{"label": "Pass 1: [1] face, [3] left eye",
+  "det_indices": [0, 2],
+  "merged_mask": np.ndarray,
+  "merged_bbox": [x1, y1, x2, y2]}, ...]
+```
+
+Mask merging uses `mask_merge()` from `adetailer/mask.py` (`cv2.bitwise_or` reduce).
+Merged bbox = bounding box of the union (min x1/y1, max x2/y2 across constituent bboxes).
 
 ### Flat Return List Convention
 
-`_run_detection()` returns a flat list `[preview, state, *accordion×N, *enable×N, *mask×N, *prompt×N, *neg×N, *denoise×N, *blur×N, *dilate×N]` = `2 + 8×N` items.
+**Three flat return lists** must stay in sync:
 
-**CRITICAL**: When adding new per-detection fields:
-1. Add to the return list in `_run_detection()` (both the populated loop AND the `empty` list)
-2. Add the component list to `detect_outputs` in `create_advanced_tab()`
-3. Both must have identical length and order
+1. `_run_detection()` returns `7 + 8×MAX_PASSES` items:
+   `[preview, state, selection_panel_vis, thumbnails, checkbox_update, passes_reset, passes_html, *accordion×N, *enable×N, *mask×N, *prompt×N, *neg×N, *denoise×N, *blur×N, *dilate×N]`
+   Must match `detect_outputs`.
 
-`_process_all()` unpacks `*args` with index math `args[k*N : (k+1)*N]`. See its docstring for layout. Update `process_inputs` to match.
+2. `_confirm_passes()` returns `8×MAX_PASSES` items:
+   `[*accordion×N, *enable×N, *mask×N, *prompt×N, *neg×N, *denoise×N, *blur×N, *dilate×N]`
+   Must match `confirm_outputs`.
+
+3. `_process_all()` unpacks `*args` with `args[k*N : (k+1)*N]`.
+   Must match `process_inputs` (which starts with `[detection_state, passes_state]`).
+
+**CRITICAL**: When adding new per-pass fields, update ALL THREE return lists AND their corresponding output/input component lists.
+
+### Selection Panel
+
+Located on the Detection tab (below detect controls), hidden until detection runs.
+Contains:
+- `det_thumbnails` — Gallery of per-detection mask overlays
+- `det_checkbox_group` — CheckboxGroup with labels like `"[1] face_yolov8n — 0.95"`
+- **Add Pass** / **Auto: 1 per detection** / **Clear Passes** buttons
+- `passes_display` — HTML showing current pass assignments
+- **Confirm & Continue** button
+
+Detections assigned to a pass are removed from checkbox choices (no double-assignment).
+"Auto: 1 per detection" creates one pass per remaining unassigned detection.
 
 ### Cross-Tab Send-To Buttons
 
@@ -140,21 +180,23 @@ Ultralytics model loading requires temporarily disabling WebUI's safe unpickle c
 | Scheduler | Automatic | Hardcoded |
 | Padding | 32 | Hardcoded |
 | BBox Match | Strict | Hardcoded |
-| Denoising | 0.4 | Per-detection default |
-| Mask Blur | 4 | Per-detection default |
-| Dilate | 4 | Per-detection default |
+| Denoising | 0.4 | Per-pass default |
+| Mask Blur | 4 | Per-pass default |
+| Dilate | 4 | Per-pass default |
 | Styles | ["Illustrious", "style"] | Hardcoded |
 
 ## Common Pitfalls
 
-1. **Output list mismatch** — Adding a per-detection field to `_run_detection` but forgetting `detect_outputs` (or vice versa) causes a silent Gradio error with no visible feedback.
+1. **Output list mismatch** — Adding a per-pass field to `_run_detection` / `_confirm_passes` but forgetting `detect_outputs` / `confirm_outputs` (or vice versa) causes a silent Gradio error with no visible feedback. Three lists must stay in sync.
 
 2. **Gallery vs Image** — `gr.Gallery` expects `list[PIL]`, `gr.Image` expects `PIL|None`. The paste-params mechanism outputs single PIL. Always bridge with hidden Image → `.change()`.
 
 3. **on_app_started is too late** — Never register `.click()` handlers there. Use `register_paste_params_button` or wire inside `create_advanced_tab`.
 
-4. **Re-detection must reset fields** — If detection is re-run, ALL per-detection inputs must be reset to defaults. Otherwise stale values from previous detections persist in accordion slots.
+4. **Re-detection must reset everything** — If detection is re-run, ALL passes are cleared, selection panel is reset, and ALL accordion inputs are reset to defaults. This prevents stale values from previous detections leaking.
 
 5. **elem_id naming for tag autocomplete** — If you rename elem_ids on prompt/neg textboxes, update the CSS selectors in `a1111-sd-webui-tagcomplete/javascript/_textAreas.js`.
 
 6. **Gradio 3.x** — Forge uses Gradio 3.x, not 4.x. Use `gr.update(...)` not component constructors for updates. `InputAccordion` is a WebUI custom component, not upstream Gradio.
+
+7. **CheckboxGroup choices tracking** — When adding a pass, `_add_pass_wrapper` rebuilds available choices from `detection_state` minus already-assigned indices, because Gradio 3.x CheckboxGroup only provides the selected values (not the current choices list) as input.

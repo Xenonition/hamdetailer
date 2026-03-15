@@ -6,66 +6,61 @@ Adds a top-level "ADetailer+" tab to the WebUI with the following workflow:
 1. Upload / send an image
 2. Select one or more detection (seg) models
 3. Click **Run Detection** → preview with bounding boxes, masks, labels
-4. Each detection gets its own InputAccordion with per-region inpainting overrides
-5. Click **Process** → standard img2img inpainting per detection
+4. **Selection panel** appears with numbered thumbnails + CheckboxGroup
+5. User iteratively builds **passes**: check detections → *Add Pass* → repeat
+6. Click **Confirm & Continue** → switches to Inpainting tab with one accordion
+   per pass (masks within a pass are union-merged)
+7. Click **Process** → standard img2img inpainting per pass
 
 Implementation Notes
 --------------------
 
+**Pass-based architecture**:
+    After detection, accordions are NOT shown immediately.  Instead a selection
+    panel lets the user build *passes* — groups of detections whose masks are
+    union-merged via ``mask_merge()`` from ``adetailer/mask.py``.  Each pass
+    gets one InputAccordion with shared prompt / settings.
+
+    The ``passes_state`` (a ``gr.State``) holds a list of dicts::
+
+        [
+            {"label": "Pass 1: [1] face, [3] left eye",
+             "det_indices": [0, 2],
+             "merged_mask": np.ndarray,
+             "merged_bbox": [x1, y1, x2, y2]},
+            ...
+        ]
+
+    Up to ``MAX_PASSES`` (8) passes are supported.  Each pass maps to one
+    InputAccordion slot on the Inpainting tab.
+
 **UI structure**:
     Two-tab layout inside a top-level ``gr.Blocks``:
-    - *Detection tab*  — left: model selector + detect button, right: input Gallery
-    - *Inpainting tab* — left: common settings + N InputAccordions, right: Preview/Output sub-tabs
-    Auto-switches to Inpainting after detection, to Output sub-tab after processing.
+    - *Detection tab*  — left: model selector + detect button + selection panel,
+      right: input Gallery (top), detection preview Gallery (bottom, after detect)
+    - *Inpainting tab* — left: common settings + N InputAccordions (one per pass),
+      right: Output sub-tab.  Auto-switches to Output after processing.
+
+**Selection panel** (on Detection tab, shown after detect):
+    - ``det_thumbnails`` — ``gr.Gallery`` showing per-detection mask overlay
+      thumbnails numbered [1], [2], …
+    - ``det_checkbox_group`` — ``gr.CheckboxGroup`` with labels like
+      ``"[1] face_yolov8n — 0.95"``
+    - *Add Pass* button, *Auto: 1 per detection* shortcut, *Clear Passes* button
+    - ``passes_display`` — ``gr.HTML`` showing current pass assignments
+    - *Confirm & Continue* button
 
 **Flat return lists for Gradio**:
-    ``_run_detection()`` returns a flat list whose length is ``2 + 8×MAX_DETECTIONS``:
-        [preview, state,
-         ×N accordion_updates, ×N enable_updates, ×N mask_previews,
-         ×N prompt_resets, ×N neg_prompt_resets,
-         ×N denoise_resets, ×N mask_blur_resets, ×N dilate_resets]
-    The ``detect_outputs`` list in ``create_advanced_tab`` must match this layout
-    exactly.  When adding new per-detection fields, update BOTH places.
+    ``_run_detection()`` returns a flat list consumed by ``detect_outputs``.
+    ``_confirm_passes()`` returns a flat list consumed by ``confirm_outputs``.
+    ``_process_all()`` unpacks ``*args`` with ×MAX_PASSES groups.
+    The ``detect_outputs``, ``confirm_outputs``, and ``process_inputs`` lists
+    in ``create_advanced_tab`` must match exactly.
 
-    ``_process_all()`` unpacks ``*args`` with the same ×N groups; see its docstring
-    for the exact index math.  The ``process_inputs`` list must match.
-
-**Re-detection resets all per-slot fields**:
-    Running detection again fully resets prompt, neg prompt, denoising, mask blur,
-    and dilate to their defaults for ALL slots—even slots that remain visible.
-    This prevents stale values from a previous detection leaking into new results
-    (e.g., run face+eye → run mouth: slot 0 must not keep the old face prompt).
-
-**Input Gallery vs hidden Image bridge for send-to buttons**:
-    txt2img / img2img send-to buttons use the WebUI's ``parameters_copypaste``
-    mechanism (``add_paste_fields`` + ``register_paste_params_button``), which
-    requires the destination to be a ``gr.Image`` (since ``image_from_url_text``
-    returns a single PIL image, not a list).  A hidden ``gr.Image`` receives the
-    image, then its ``.change()`` event wraps it in a list and forwards to the
-    input ``gr.Gallery``.  This bridge is necessary because Gallery expects a list.
-
-    The paste-fields are registered under tabname ``"adetailer_plus"``, which
-    corresponds to the JS function ``switch_to_adetailer_plus()`` in
-    ``javascript/adetailer_plus.js``.  The ``connect_paste_params_buttons()``
-    call in the main ``ui.py`` automatically appends a ``.click(_js=...)`` that
-    calls that function to switch tabs.
-
-**Button timing (on_after_component vs on_app_started)**:
-    The 🔀 ToolButtons in txt2img/img2img output panels are created inside
-    ``on_after_component`` (in ``!adetailer.py``) and registered via
-    ``register_paste_params_button`` at creation time.  This is critical:
-    ``on_app_started`` fires AFTER ``demo.launch()``, at which point Gradio
-    routes are finalized and new ``.click()`` registrations have no effect.
-    ``register_paste_params_button`` stores the binding, and
-    ``connect_paste_params_buttons()`` (called inside ``with gr.Blocks() as demo:``
-    in the main ``ui.py``) wires them up at the correct time.
-
-**Tag Autocomplete integration**:
-    The a1111-sd-webui-tagcomplete extension discovers prompt textareas via
-    CSS selectors + MutationObserver.  An ``"adetailer-plus"`` entry in
-    ``_textAreas.js`` targets ``[id^=ad_adv_det_][id$=_prompt]`` and
-    ``[id^=ad_adv_det_][id$=_neg]`` inside ``#tab_adetailer_advanced``,
-    with ``onDemand: true`` so the observer fires when InputAccordions appear.
+**Hidden Image bridge for send-to buttons**:
+    txt2img / img2img send-to buttons use ``parameters_copypaste``; a hidden
+    ``gr.Image`` receives a single PIL, then ``.change()`` wraps it as ``[img]``
+    and forwards to the Gallery.
 
 **InputAccordion acts as both accordion + checkbox**:
     ``InputAccordion`` yields a component that is stored in ``det_enables``
@@ -74,27 +69,26 @@ Implementation Notes
 
 **gr.State serialisation**:
     Detection state stores masks as ``np.ndarray`` (not PIL) because ``gr.State``
-    round-trips through JSON serialization which can lose PIL metadata.  Images
-    are converted back via ``Image.fromarray`` in ``_process_all``.
+    round-trips through JSON serialization which can lose PIL metadata.
 
 **vec_cc guard**:
     The Vectorscope CC extension patches ``KDiffusionSampler`` with a ``vec_cc``
-    attribute only during ``process_batch``.  When ADetailer+ creates its own
-    ``StableDiffusionProcessingImg2Img``, the attribute may not exist yet,
-    causing ``AttributeError``.  A guard sets a disabled default before each
-    ``process_images`` call.
+    attribute only during ``process_batch``.  A guard sets a disabled default
+    before each ``process_images`` call.
 
 **Script runner isolation**:
     ``_process_all`` uses a shallow copy of ``scripts_img2img`` with
-    ``alwayson_scripts = []`` to prevent re-entrant hooks (e.g., the main
-    ADetailer script calling itself recursively).
+    ``alwayson_scripts = []`` to prevent re-entrant hooks.
+
+**Tag Autocomplete integration**:
+    elem_id convention ``ad_adv_det_{i}_prompt`` / ``ad_adv_det_{i}_neg`` is
+    preserved for the ``a1111-sd-webui-tagcomplete`` CSS selectors.
 """
 
 from __future__ import annotations
 
 import platform
 from copy import copy
-from functools import partial
 from typing import Any
 
 import gradio as gr
@@ -104,11 +98,12 @@ from rich import print  # noqa: A004
 
 from adetailer import ADETAILER, __version__, mediapipe_predict, ultralytics_predict
 from adetailer.common import PredictOutput, draw_detection_overlay, ensure_pil_image
-from adetailer.mask import dilate_erode
+from adetailer.mask import dilate_erode, mask_merge
 from adetailer.args import INPAINT_BBOX_MATCH_MODES, InpaintBBoxMatchMode
 from adetailer.opts import optimal_crop_size
 
 MAX_DETECTIONS = 8
+MAX_PASSES = 8
 
 # Module-level reference for cross-tab send-to wiring
 ad_plus_input_gallery = None
@@ -161,6 +156,56 @@ def _make_mask_preview(
     return preview
 
 
+def _make_merged_mask_preview(
+    source: Image.Image,
+    merged_mask: Image.Image,
+    merged_bbox: list,
+    label: str,
+) -> Image.Image:
+    """Overlay a merged pass mask on the source for preview."""
+    preview = source.copy()
+    overlay = Image.new("RGB", preview.size, (57, 150, 230))
+    masked = Image.composite(overlay, preview, merged_mask)
+    preview = Image.blend(preview, masked, 0.4)
+
+    draw = ImageDraw.Draw(preview)
+    x1, y1, x2, y2 = (int(v) for v in merged_bbox)
+    draw.rectangle([x1, y1, x2, y2], outline="#3996E6", width=2)
+    font = ImageFont.load_default()
+    draw.text(
+        (x1 + 2, max(y1 - 14, 0)),
+        label,
+        fill="#3996E6",
+        font=font,
+    )
+    return preview
+
+
+def _det_choice_label(index: int, label: str, conf: float) -> str:
+    """Build a CheckboxGroup choice label for a detection."""
+    return f"[{index + 1}] {label} \u2014 {conf:.2f}"
+
+
+def _merge_bboxes(bboxes: list[list]) -> list:
+    """Compute the bounding box of the union of multiple bboxes."""
+    x1 = min(b[0] for b in bboxes)
+    y1 = min(b[1] for b in bboxes)
+    x2 = max(b[2] for b in bboxes)
+    y2 = max(b[3] for b in bboxes)
+    return [x1, y1, x2, y2]
+
+
+def _render_passes_html(passes: list) -> str:
+    """Render the current passes list as HTML for display."""
+    if not passes:
+        return "<p style='color:gray; font-style:italic'>No passes defined yet.</p>"
+
+    lines = []
+    for p in passes:
+        lines.append(f"<b>{p['label']}</b>")
+    return "<br>".join(lines)
+
+
 # ---------------------------------------------------------------------------
 #  Detection callback
 # ---------------------------------------------------------------------------
@@ -175,36 +220,46 @@ def _run_detection(
     """
     Run selected detection models on *image*.
 
-    Returns a flat output list consumed by Gradio:
-        [preview, state,
-         *accordion_updates(×N), *enable_updates(×N), *mask_previews(×N),
-         *prompt_resets(×N), *neg_prompt_resets(×N),
-         *denoise_resets(×N), *mask_blur_resets(×N), *dilate_resets(×N)]
+    Returns a flat output list consumed by Gradio::
+
+        [preview_gallery, detection_state,
+         selection_panel_visible, det_thumbnails, checkbox_choices_update,
+         passes_state_reset, passes_html_reset,
+         *accordion_hidden(xN), *enable_reset(xN), *mask_preview_reset(xN),
+         *prompt_reset(xN), *neg_prompt_reset(xN),
+         *denoise_reset(xN), *blur_reset(xN), *dilate_reset(xN)]
+
+    Total length: 7 + 8*MAX_PASSES
     """
-    # Normalise multi-select value
     if isinstance(models_selected, str):
         models_selected = [models_selected]
     if not models_selected:
         models_selected = []
 
-    # Defaults – nothing detected
+    N = MAX_PASSES
+    # Defaults - nothing detected; hide selection panel and all accordions
     empty: list[Any] = (
-        [None, None]
-        + [gr.update(visible=False)] * MAX_DETECTIONS   # accordion
-        + [gr.update(value=True)] * MAX_DETECTIONS       # enable checkbox
-        + [None] * MAX_DETECTIONS                        # mask previews
-        + [gr.update(value="")] * MAX_DETECTIONS          # prompt resets
-        + [gr.update(value="")] * MAX_DETECTIONS          # neg prompt resets
-        + [gr.update(value=0.4)] * MAX_DETECTIONS         # denoise resets
-        + [gr.update(value=4)] * MAX_DETECTIONS           # mask blur resets
-        + [gr.update(value=4)] * MAX_DETECTIONS           # dilate resets
+        [None, None]                                      # preview, state
+        + [gr.update(visible=False)]                      # selection panel
+        + [None]                                          # thumbnails gallery
+        + [gr.update(choices=[], value=[])]               # checkbox
+        + [[]]                                            # passes_state reset
+        + [""]                                            # passes_html reset
+        + [gr.update(visible=False)] * N                  # accordions
+        + [gr.update(value=True)] * N                     # enables
+        + [None] * N                                      # mask previews
+        + [gr.update(value="")] * N                       # prompts
+        + [gr.update(value="")] * N                       # neg prompts
+        + [gr.update(value=0.4)] * N                      # denoise
+        + [gr.update(value=4)] * N                        # mask blur
+        + [gr.update(value=4)] * N                        # dilate
     )
 
     if image is None:
         return empty
 
     if not models_selected:
-        empty[0] = image
+        empty[0] = [image]
         return empty
 
     image = ensure_pil_image(image, "RGB")
@@ -217,7 +272,7 @@ def _run_detection(
 
     for model_name in models_selected:
         if model_name not in model_mapping:
-            print(f"[-] ADetailer+: model {model_name!r} not in mapping – skipped")
+            print(f"[-] ADetailer+: model {model_name!r} not in mapping - skipped")
             continue
 
         model_path = model_mapping[model_name]
@@ -245,7 +300,7 @@ def _run_detection(
             all_labels.extend([model_name] * len(pred.bboxes))
 
     if not all_bboxes:
-        empty[0] = image
+        empty[0] = [image]
         return empty
 
     total_found = len(all_bboxes)
@@ -260,6 +315,16 @@ def _run_detection(
         image, all_bboxes, all_masks, all_confidences, all_labels
     )
 
+    # Per-detection thumbnails for selection gallery
+    thumbnails = []
+    checkbox_choices = []
+    for i in range(n):
+        thumb = _make_mask_preview(
+            image, all_masks[i], all_bboxes[i], all_labels[i], all_confidences[i]
+        )
+        thumbnails.append(thumb)
+        checkbox_choices.append(_det_choice_label(i, all_labels[i], all_confidences[i]))
+
     # State stored as numpy for safe gr.State serialisation
     state = {
         "source": np.array(image),
@@ -270,33 +335,232 @@ def _run_detection(
         "labels": all_labels,
     }
 
-    # Per-slot UI updates
-    accordion_updates: list = []
-    enable_updates: list = []
-    mask_previews: list = []
-    prompt_resets: list = []
-    neg_prompt_resets: list = []
-    denoise_resets: list = []
-    mask_blur_resets: list = []
-    dilate_resets: list = []
-    for i in range(MAX_DETECTIONS):
-        if i < n:
-            lbl = f"[{i + 1}] {all_labels[i]} — conf {all_confidences[i]:.2f}"
+    N = MAX_PASSES
+    return (
+        [[preview], state]                                # preview gallery, state
+        + [gr.update(visible=True)]                       # selection panel visible
+        + [thumbnails]                                    # thumbnails gallery
+        + [gr.update(choices=checkbox_choices, value=[])] # checkbox choices reset
+        + [[]]                                            # passes_state reset
+        + [""]                                            # passes_html reset
+        + [gr.update(visible=False)] * N                  # hide all accordions
+        + [gr.update(value=True)] * N                     # enable resets
+        + [None] * N                                      # mask preview resets
+        + [gr.update(value="")] * N                       # prompt resets
+        + [gr.update(value="")] * N                       # neg prompt resets
+        + [gr.update(value=0.4)] * N                      # denoise resets
+        + [gr.update(value=4)] * N                        # mask blur resets
+        + [gr.update(value=4)] * N                        # dilate resets
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Pass-building callbacks
+# ---------------------------------------------------------------------------
+
+def _add_pass(
+    passes: list,
+    selected_labels: list[str],
+    detection_state: dict | None,
+    all_choices: list[str],
+):
+    """
+    Add a new pass from the currently checked detections.
+
+    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    """
+    if detection_state is None:
+        return passes, gr.update(), _render_passes_html(passes), ""
+
+    if not selected_labels:
+        return (
+            passes, gr.update(), _render_passes_html(passes),
+            "<p style='color:orange'>\u26a0 Select at least one detection.</p>",
+        )
+
+    if len(passes) >= MAX_PASSES:
+        return (
+            passes, gr.update(), _render_passes_html(passes),
+            f"<p style='color:orange'>\u26a0 Maximum {MAX_PASSES} passes reached.</p>",
+        )
+
+    n = detection_state["n"]
+    labels = detection_state["labels"]
+    confidences = detection_state["confidences"]
+
+    # Map selected labels back to detection indices
+    choice_to_idx = {}
+    for i in range(n):
+        lbl = _det_choice_label(i, labels[i], confidences[i])
+        choice_to_idx[lbl] = i
+
+    det_indices = []
+    for sel in selected_labels:
+        if sel in choice_to_idx:
+            det_indices.append(choice_to_idx[sel])
+    if not det_indices:
+        return (
+            passes, gr.update(), _render_passes_html(passes),
+            "<p style='color:orange'>\u26a0 No valid detections selected.</p>",
+        )
+
+    pass_num = len(passes) + 1
+    parts = []
+    for idx in sorted(det_indices):
+        parts.append(f"[{idx + 1}] {labels[idx]}")
+    pass_label = f"Pass {pass_num}: {', '.join(parts)}"
+
+    # Merge masks
+    masks_pil = [Image.fromarray(detection_state["masks"][idx]) for idx in det_indices]
+    if len(masks_pil) > 1:
+        merged_masks = mask_merge(masks_pil)
+        merged_mask_np = np.array(merged_masks[0])
+    else:
+        merged_mask_np = detection_state["masks"][det_indices[0]]
+
+    bboxes = [detection_state["bboxes"][idx] for idx in det_indices]
+    merged_bbox = _merge_bboxes(bboxes)
+
+    new_pass = {
+        "label": pass_label,
+        "det_indices": det_indices,
+        "merged_mask": merged_mask_np,
+        "merged_bbox": merged_bbox,
+    }
+
+    passes = list(passes) + [new_pass]
+
+    # Remove used choices from checkbox
+    remaining = [c for c in all_choices if c not in selected_labels]
+    cb_update = gr.update(choices=remaining, value=[])
+
+    return passes, cb_update, _render_passes_html(passes), ""
+
+
+def _auto_one_per_detection(detection_state: dict | None, existing_passes: list):
+    """
+    Shortcut: create one pass per detection automatically.
+
+    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    """
+    if detection_state is None:
+        return existing_passes, gr.update(), _render_passes_html(existing_passes), ""
+
+    n = detection_state["n"]
+    if n == 0:
+        return existing_passes, gr.update(), _render_passes_html(existing_passes), ""
+
+    labels = detection_state["labels"]
+    confidences = detection_state["confidences"]
+
+    # Find which indices are already assigned
+    used = set()
+    for p in existing_passes:
+        used.update(p["det_indices"])
+
+    passes = list(existing_passes)
+    for i in range(n):
+        if i in used:
+            continue
+        if len(passes) >= MAX_PASSES:
+            break
+
+        pass_num = len(passes) + 1
+        pass_label = f"Pass {pass_num}: [{i + 1}] {labels[i]}"
+        new_pass = {
+            "label": pass_label,
+            "det_indices": [i],
+            "merged_mask": detection_state["masks"][i],
+            "merged_bbox": detection_state["bboxes"][i],
+        }
+        passes.append(new_pass)
+
+    # All choices consumed
+    cb_update = gr.update(choices=[], value=[])
+    return passes, cb_update, _render_passes_html(passes), ""
+
+
+def _clear_passes(detection_state: dict | None):
+    """
+    Clear all passes and restore all detection choices.
+
+    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    """
+    if detection_state is None:
+        return [], gr.update(choices=[], value=[]), "", ""
+
+    n = detection_state["n"]
+    labels = detection_state["labels"]
+    confidences = detection_state["confidences"]
+
+    all_choices = [_det_choice_label(i, labels[i], confidences[i]) for i in range(n)]
+    cb_update = gr.update(choices=all_choices, value=[])
+    return [], cb_update, "", ""
+
+
+# ---------------------------------------------------------------------------
+#  Confirm passes -> populate accordions
+# ---------------------------------------------------------------------------
+
+def _confirm_passes(detection_state: dict | None, passes: list):
+    """
+    Finalize pass selection and populate Inpainting tab accordions.
+
+    Returns a flat list::
+
+        [*accordion_updates(xN), *enable_updates(xN),
+         *mask_previews(xN),
+         *prompt_resets(xN), *neg_prompt_resets(xN),
+         *denoise_resets(xN), *blur_resets(xN),
+         *dilate_resets(xN)]
+
+    Total length: 8 * MAX_PASSES
+    """
+    N = MAX_PASSES
+    empty = (
+        [gr.update(visible=False)] * N   # accordions
+        + [gr.update(value=True)] * N    # enables
+        + [None] * N                     # mask previews
+        + [gr.update(value="")] * N      # prompts
+        + [gr.update(value="")] * N      # neg prompts
+        + [gr.update(value=0.4)] * N     # denoise
+        + [gr.update(value=4)] * N       # blur
+        + [gr.update(value=4)] * N       # dilate
+    )
+
+    if detection_state is None or not passes:
+        return empty
+
+    source = Image.fromarray(detection_state["source"])
+    n_passes = min(len(passes), N)
+
+    accordion_updates = []
+    enable_updates = []
+    mask_previews = []
+    prompt_resets = []
+    neg_prompt_resets = []
+    denoise_resets = []
+    mask_blur_resets = []
+    dilate_resets = []
+
+    for i in range(N):
+        if i < n_passes:
+            p = passes[i]
             accordion_updates.append(
-                gr.update(visible=True, label=lbl, open=(i == 0))
+                gr.update(visible=True, label=p["label"], open=(i == 0))
             )
             enable_updates.append(gr.update(value=True))
-            mask_previews.append(
-                _make_mask_preview(
-                    image, all_masks[i], all_bboxes[i],
-                    all_labels[i], all_confidences[i],
-                )
+
+            merged_mask = Image.fromarray(p["merged_mask"])
+            preview = _make_merged_mask_preview(
+                source, merged_mask, p["merged_bbox"], p["label"]
             )
+            mask_previews.append(preview)
         else:
             accordion_updates.append(gr.update(visible=False))
             enable_updates.append(gr.update(value=True))
             mask_previews.append(None)
-        # Always reset per-detection fields to defaults on re-detection
+
         prompt_resets.append(gr.update(value=""))
         neg_prompt_resets.append(gr.update(value=""))
         denoise_resets.append(gr.update(value=0.4))
@@ -304,8 +568,7 @@ def _run_detection(
         dilate_resets.append(gr.update(value=4))
 
     return (
-        [preview, state]
-        + accordion_updates + enable_updates + mask_previews
+        accordion_updates + enable_updates + mask_previews
         + prompt_resets + neg_prompt_resets
         + denoise_resets + mask_blur_resets + dilate_resets
     )
@@ -315,28 +578,28 @@ def _run_detection(
 #  Processing callback
 # ---------------------------------------------------------------------------
 
-def _process_all(state: dict | None, *args):
+def _process_all(detection_state: dict | None, passes_state: list | None, *args):
     """
-    Inpaint each enabled detection sequentially through img2img.
+    Inpaint each enabled pass sequentially through img2img.
 
-    *args* layout (flat)::
+    Passes use union-merged masks.  *args* layout (flat)::
 
-        enables       ×MAX   [0N  .. 1N)
-        prompts       ×MAX   [1N  .. 2N)
-        neg_prompts   ×MAX   [2N  .. 3N)
-        denoises      ×MAX   [3N  .. 4N)
-        mask_blurs    ×MAX   [4N  .. 5N)
-        dilate_erodes ×MAX   [5N  .. 6N)
+        enables       xMAX_PASSES  [0N  .. 1N)
+        prompts       xMAX_PASSES  [1N  .. 2N)
+        neg_prompts   xMAX_PASSES  [2N  .. 3N)
+        denoises      xMAX_PASSES  [3N  .. 4N)
+        mask_blurs    xMAX_PASSES  [4N  .. 5N)
+        dilate_erodes xMAX_PASSES  [5N  .. 6N)
         --- common ---
-        steps, cfg, width, height, sampler, scheduler, padding, bbox_match, styles  [6N .. 6N+8 + styles]
+        steps, cfg, width, height, sampler, scheduler, padding, bbox_match, styles
     """
     from modules import paths, scripts as ms, shared
     from modules.processing import StableDiffusionProcessingImg2Img, process_images
 
-    if state is None:
-        return None, "⚠  Run detection first."
+    if detection_state is None or not passes_state:
+        return None, "\u26a0  Run detection and confirm passes first."
 
-    N = MAX_DETECTIONS
+    N = MAX_PASSES
     enables = args[0 * N : 1 * N]
     prompts = args[1 * N : 2 * N]
     neg_prompts = args[2 * N : 3 * N]
@@ -356,38 +619,38 @@ def _process_all(state: dict | None, *args):
     styles = list(args[c + 8]) if len(args) > c + 8 and args[c + 8] else []
 
     if shared.sd_model is None:
-        return None, "⚠  No Stable Diffusion model loaded."
+        return None, "\u26a0  No Stable Diffusion model loaded."
 
-    source = Image.fromarray(state["source"])
-    n_det = state["n"]
-    masks = [Image.fromarray(m) for m in state["masks"]]
+    source = Image.fromarray(detection_state["source"])
+    n_passes = min(len(passes_state), N)
 
     working = source.copy()
     done = 0
     outpath = getattr(paths, "data_path", ".")
 
-    for i in range(n_det):
+    for i in range(n_passes):
         if not enables[i]:
             continue
         if shared.state.interrupted:
             break
 
+        p = passes_state[i]
         prompt = str(prompts[i]).strip()
         neg_prompt = str(neg_prompts[i]).strip()
         denoise = float(denoises[i])
         m_blur = int(mask_blurs[i])
         m_dilate = int(dilate_erodes[i])
 
-        mask = masks[i]
+        mask = Image.fromarray(p["merged_mask"])
         if m_dilate != 0:
             mask = dilate_erode(mask, m_dilate)
 
-        shared.state.textinfo = f"ADetailer+ : detection {i + 1}/{n_det}"
-        print(f"[ADetailer+] Det {i+1}/{n_det}: prompt={prompt!r}, denoise={denoise}, blur={m_blur}, dilate={m_dilate}")
+        shared.state.textinfo = f"ADetailer+ : pass {i + 1}/{n_passes}"
+        print(f"[ADetailer+] Pass {i+1}/{n_passes}: prompt={prompt!r}, denoise={denoise}, blur={m_blur}, dilate={m_dilate}")
 
-        # Per-bbox optimal crop size
+        # Per-pass optimal crop size using merged bbox
         det_width, det_height = width, height
-        bbox = state["bboxes"][i]
+        bbox = p["merged_bbox"]
         if bbox_match == InpaintBBoxMatchMode.STRICT.value:
             if getattr(shared.sd_model, "is_sdxl", False):
                 det_width, det_height = optimal_crop_size.sdxl(width, height, bbox)
@@ -434,10 +697,7 @@ def _process_all(state: dict | None, *args):
             i2i._ad_disabled = True
             i2i._ad_inner = True
 
-            # Guard against extensions that monkey-patch the sampler
-            # class and lazily set attributes (e.g. Vectorscope CC sets
-            # ``vec_cc`` on KDiffusionSampler only inside process_batch,
-            # but its patched callback_state always reads it).
+            # Guard against Vectorscope CC extension
             try:
                 from modules.sd_samplers_kdiffusion import KDiffusionSampler
 
@@ -446,7 +706,7 @@ def _process_all(state: dict | None, *args):
             except Exception:
                 pass
 
-            # Minimal script runner — strip alwayson to prevent re-entrant hooks
+            # Minimal script runner - strip alwayson to prevent re-entrant hooks
             try:
                 runner = copy(ms.scripts_img2img)
                 runner.alwayson_scripts = []
@@ -465,7 +725,7 @@ def _process_all(state: dict | None, *args):
                 working = processed.images[0]
                 done += 1
         except Exception as e:
-            print(f"[-] ADetailer+: Error on detection {i + 1}: {e}")
+            print(f"[-] ADetailer+: Error on pass {i + 1}: {e}")
             continue
         finally:
             try:
@@ -473,7 +733,7 @@ def _process_all(state: dict | None, *args):
             except Exception:
                 pass
 
-    status = f"✓  Processed {done} of {n_det} detection(s)."
+    status = f"\u2713  Processed {done} of {n_passes} pass(es)."
     if shared.state.interrupted:
         status += " (interrupted)"
     return working, status
@@ -505,10 +765,8 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "..", "ui-config.json",
     )
-    # Normalise — extension lives in  <webui>/extensions/adetailer/
     _ui_cfg_path = os.path.normpath(_ui_cfg_path)
     if not os.path.isfile(_ui_cfg_path):
-        # Fallback: use paths module
         try:
             from modules import paths
             _ui_cfg_path = os.path.join(paths.data_path, "ui-config.json")
@@ -550,9 +808,9 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
 
     with gr.Blocks(analytics_enabled=False) as tab:
         detection_state = gr.State(value=None)
+        passes_state = gr.State(value=[])
 
-        # Hidden Image bridge: receives single PIL from paste-params
-        # mechanism, then forwards it to the Gallery via .change()
+        # Hidden Image bridge for paste-params
         _hidden_input = gr.Image(
             visible=False,
             elem_id="ad_adv_hidden_input",
@@ -560,12 +818,12 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         )
 
         with gr.Tabs(elem_id="ad_adv_main_tabs") as main_tabs:
-            # ══════════════════════════════════════════════════════════
+            # ==============================================================
             #  Detection tab
-            # ══════════════════════════════════════════════════════════
+            # ==============================================================
             with gr.TabItem("Detection", elem_id="ad_adv_tab_detection", id="detection_tab"):
                 with gr.Row(equal_height=True):
-                    # ── left: controls ────────────────────────────────
+                    # -- left: controls + selection panel --------
                     with gr.Column(scale=1):
                         model_dropdown = gr.Dropdown(
                             label="Detection Models",
@@ -589,7 +847,62 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                             elem_id="ad_adv_detect_btn",
                         )
 
-                    # ── right: input image ────────────────────────────
+                        # -- Selection panel (hidden until detection) --
+                        with gr.Group(visible=False, elem_id="ad_adv_selection_panel") as selection_panel:
+                            gr.Markdown("### Build inpaint passes")
+                            gr.Markdown(
+                                "Check detections below, then click **Add Pass** to "
+                                "group them into an inpaint pass. Repeat to create "
+                                "multiple passes. Each pass gets its own accordion "
+                                "with prompt and settings."
+                            )
+                            det_thumbnails = gr.Gallery(
+                                label="Detected Objects",
+                                elem_id="ad_adv_det_thumbs",
+                                columns=4,
+                                rows=2,
+                                height=200,
+                                interactive=False,
+                                object_fit="contain",
+                                type="pil",
+                            )
+                            det_checkbox_group = gr.CheckboxGroup(
+                                label="Detections",
+                                choices=[],
+                                value=[],
+                                elem_id="ad_adv_det_checkboxes",
+                            )
+                            with gr.Row():
+                                add_pass_btn = gr.Button(
+                                    "\u2795 Add Pass",
+                                    variant="secondary",
+                                    elem_id="ad_adv_add_pass",
+                                )
+                                auto_pass_btn = gr.Button(
+                                    "\u26a1 Auto: 1 per detection",
+                                    variant="secondary",
+                                    elem_id="ad_adv_auto_pass",
+                                )
+                                clear_passes_btn = gr.Button(
+                                    "\U0001f5d1\ufe0f Clear Passes",
+                                    variant="secondary",
+                                    elem_id="ad_adv_clear_passes",
+                                )
+                            passes_display = gr.HTML(
+                                value="",
+                                elem_id="ad_adv_passes_display",
+                            )
+                            selection_status = gr.HTML(
+                                value="",
+                                elem_id="ad_adv_selection_status",
+                            )
+                            confirm_btn = gr.Button(
+                                "Confirm & Continue \u279c",
+                                variant="primary",
+                                elem_id="ad_adv_confirm_btn",
+                            )
+
+                    # -- right: input image + preview -----------
                     with gr.Column(scale=1, elem_id="ad_adv_input_col"):
                         with gr.Column(variant="panel"):
                             with gr.Group():
@@ -604,15 +917,24 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                     object_fit="contain",
                                     type="pil",
                                 )
+                            with gr.Group():
+                                preview_image = gr.Gallery(
+                                    label="Detection Preview",
+                                    show_label=True,
+                                    elem_id="ad_adv_preview",
+                                    columns=1,
+                                    preview=True,
+                                    height=gallery_height,
+                                    interactive=False,
+                                    object_fit="contain",
+                                    type="pil",
+                                )
 
             # Expose input_image at module level for cross-tab wiring
             global ad_plus_input_gallery
             ad_plus_input_gallery = input_image
 
-            # Register as paste-params destination so connect_paste_params_buttons
-            # can wire the send-to buttons created by on_after_component.
-            # The hidden Image receives a single PIL from image_from_url_text,
-            # then .change() bridges it to the Gallery.
+            # Register paste-params destination
             parameters_copypaste.add_paste_fields(
                 "adetailer_plus", _hidden_input, [], None
             )
@@ -623,12 +945,12 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                 show_progress=False,
             )
 
-            # ══════════════════════════════════════════════════════════
+            # ==============================================================
             #  Inpainting tab
-            # ══════════════════════════════════════════════════════════
+            # ==============================================================
             with gr.TabItem("Inpainting", elem_id="ad_adv_tab_inpainting", id="inpainting_tab"):
                 with gr.Row(equal_height=True):
-                    # ── left: settings + per-detection accordions ─────
+                    # -- left: settings + per-pass accordions ---
                     with gr.Column(scale=1):
                         with gr.Accordion("Inpainting Settings", open=True):
                             with gr.Row():
@@ -681,7 +1003,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                     elem_id="ad_adv_styles",
                                 )
 
-                        # Per-detection accordions
+                        # Per-pass accordions (one per pass, up to MAX_PASSES)
                         det_accordions: list[gr.Accordion] = []
                         det_mask_previews: list[gr.Image] = []
                         det_enables = []  # InputAccordion (acts as Checkbox)
@@ -691,15 +1013,14 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                         det_mask_blurs: list[gr.Slider] = []
                         det_dilates: list[gr.Slider] = []
 
-                        for i in range(MAX_DETECTIONS):
+                        for i in range(MAX_PASSES):
                             with InputAccordion(
                                 value=True,
-                                label=f"Detection {i + 1}",
+                                label=f"Pass {i + 1}",
                                 visible=False,
                                 elem_id=f"ad_adv_det_{i}",
                             ) as en:
                                 with gr.Row(equal_height=True):
-                                    # ── left column: inputs ──
                                     with gr.Column(scale=1):
                                         pr = gr.Textbox(
                                             label="Prompt",
@@ -729,7 +1050,6 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                                 maximum=128, step=4, value=4,
                                                 elem_id=f"ad_adv_det_{i}_dil",
                                             )
-                                    # ── right column: mask preview ──
                                     with gr.Column(scale=1):
                                         mprev = gr.Image(
                                             label="Mask",
@@ -748,29 +1068,14 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                 det_dilates.append(dil)
 
                         process_btn = gr.Button(
-                            "Process All Detections",
+                            "Process All Passes",
                             variant="primary",
                             elem_id="ad_adv_process_btn",
                         )
 
-                    # ── right: preview / output ───────────────────────
+                    # -- right: output --------------------------
                     with gr.Column(scale=1, elem_id="ad_adv_results"):
                         with gr.Tabs(elem_id="ad_adv_result_tabs") as result_tabs:
-                            with gr.TabItem("Preview", elem_id="ad_adv_preview_tab", id="preview_tab"):
-                                with gr.Column(variant="panel"):
-                                    with gr.Group():
-                                        preview_image = gr.Gallery(
-                                            label="Detection Preview",
-                                            show_label=False,
-                                            elem_id="ad_adv_preview",
-                                            columns=1,
-                                            preview=True,
-                                            height=gallery_height,
-                                            interactive=False,
-                                            object_fit="contain",
-                                            type="pil",
-                                        )
-
                             with gr.TabItem("Output", elem_id="ad_adv_output_tab", id="output_tab"):
                                 with gr.Column(variant="panel", elem_id="ad_adv_output_panel"):
                                     with gr.Group(elem_id="ad_adv_output_gallery_container"):
@@ -788,23 +1093,23 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
 
                                     with gr.Row(elem_id="ad_adv_image_buttons", elem_classes="image-buttons"):
                                         reuse_btn = ToolButton(
-                                            '🔄', elem_id="ad_adv_reuse_output",
+                                            '\U0001f504', elem_id="ad_adv_reuse_output",
                                             tooltip="Send output back to ADetailer+ input",
                                         )
                                         save_btn = ToolButton(
-                                            '💾', elem_id="ad_adv_save",
+                                            '\U0001f4be', elem_id="ad_adv_save",
                                             tooltip=f"Save image ({opts.outdir_save})",
                                         )
                                         send_img2img_btn = ToolButton(
-                                            '🖼️', elem_id="ad_adv_send_img2img",
+                                            '\U0001f5bc\ufe0f', elem_id="ad_adv_send_img2img",
                                             tooltip="Send to img2img",
                                         )
                                         send_inpaint_btn = ToolButton(
-                                            '🎨️', elem_id="ad_adv_send_inpaint",
+                                            '\U0001f3a8\ufe0f', elem_id="ad_adv_send_inpaint",
                                             tooltip="Send to img2img inpaint",
                                         )
                                         send_extras_btn = ToolButton(
-                                            '📐', elem_id="ad_adv_send_extras",
+                                            '\U0001f4d0', elem_id="ad_adv_send_extras",
                                             tooltip="Send to extras",
                                         )
 
@@ -818,10 +1123,12 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                         elem_classes="html-log",
                                     )
 
-        # ── Event wiring ──────────────────────────────────────────────
+        # ==============================================================
+        #  Event wiring
+        # ==============================================================
 
-        # Adapt detection callback: input_image is now a gallery so we
-        # extract the first PIL image from the list for the detector.
+        # -- Detection --------------------------------------------------
+
         def _detect_from_gallery(gallery_images, models_sel, conf):
             img = None
             if gallery_images:
@@ -832,14 +1139,15 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                     img = first
                 else:
                     img = first
-            result = _run_detection(img, models_sel, conf, model_mapping=model_mapping)
-            # result[0] is preview PIL; wrap it in a list for gr.Gallery
-            if result[0] is not None:
-                result[0] = [result[0]]
-            return result
+            return _run_detection(img, models_sel, conf, model_mapping=model_mapping)
 
         detect_outputs = (
             [preview_image, detection_state]
+            + [selection_panel]
+            + [det_thumbnails]
+            + [det_checkbox_group]    # choices + value update
+            + [passes_state]
+            + [passes_display]
             + det_accordions
             + det_enables
             + det_mask_previews
@@ -849,8 +1157,9 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             + det_mask_blurs
             + det_dilates
         )
+
         detect_btn.click(
-            fn=lambda: gr.update(value="⏳ Detecting…", interactive=False),
+            fn=lambda: gr.update(value="\u23f3 Detecting\u2026", interactive=False),
             inputs=None,
             outputs=detect_btn,
         ).then(
@@ -861,20 +1170,102 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             fn=lambda: gr.update(value="Run Detection", interactive=True),
             inputs=None,
             outputs=detect_btn,
+        )
+
+        # -- Pass building ----------------------------------------------
+
+        # _add_pass needs: passes_state, selected checkboxes, detection_state,
+        # and the current checkbox choices (to compute remaining).
+        # In Gradio 3.x CheckboxGroup passed as value gives the selected list;
+        # to also get the choices we pass it twice (value + component ref).
+        # However the component ref only gives value, not choices. So we need
+        # a workaround: _add_pass rebuilds the full choice list from
+        # detection_state and subtracts all already-assigned indices.
+
+        def _add_pass_wrapper(passes, selected, det_state):
+            if det_state is None:
+                return passes, gr.update(), _render_passes_html(passes), ""
+
+            # Rebuild available choices from detection_state minus already-used
+            used = set()
+            for p in passes:
+                used.update(p["det_indices"])
+
+            n = det_state["n"]
+            labels = det_state["labels"]
+            confidences = det_state["confidences"]
+            available = []
+            for i in range(n):
+                if i not in used:
+                    available.append(_det_choice_label(i, labels[i], confidences[i]))
+
+            return _add_pass(passes, selected, det_state, available)
+
+        add_pass_btn.click(
+            fn=_add_pass_wrapper,
+            inputs=[passes_state, det_checkbox_group, detection_state],
+            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+        )
+
+        auto_pass_btn.click(
+            fn=_auto_one_per_detection,
+            inputs=[detection_state, passes_state],
+            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+        )
+
+        clear_passes_btn.click(
+            fn=_clear_passes,
+            inputs=[detection_state],
+            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+        )
+
+        # -- Confirm passes -> populate accordions -----------------------
+
+        confirm_outputs = (
+            det_accordions
+            + det_enables
+            + det_mask_previews
+            + det_prompts
+            + det_neg_prompts
+            + det_denoises
+            + det_mask_blurs
+            + det_dilates
+        )
+
+        def _confirm_and_check(det_state, passes):
+            if not passes:
+                N = MAX_PASSES
+                return (
+                    [gr.update()] * N     # accordions
+                    + [gr.update()] * N   # enables
+                    + [gr.update()] * N   # mask previews
+                    + [gr.update()] * N   # prompts
+                    + [gr.update()] * N   # neg prompts
+                    + [gr.update()] * N   # denoise
+                    + [gr.update()] * N   # blur
+                    + [gr.update()] * N   # dilate
+                )
+            return _confirm_passes(det_state, passes)
+
+        confirm_btn.click(
+            fn=_confirm_and_check,
+            inputs=[detection_state, passes_state],
+            outputs=confirm_outputs,
         ).then(
-            fn=lambda: gr.update(selected="inpainting_tab"),
-            inputs=None,
+            fn=lambda passes: gr.update(selected="inpainting_tab") if passes else gr.update(),
+            inputs=[passes_state],
             outputs=main_tabs,
         )
 
-        # Adapt process callback: output is now a gallery
-        def _process_and_wrap(state_val, *args):
-            result_img, _status = _process_all(state_val, *args)
+        # -- Processing -------------------------------------------------
+
+        def _process_and_wrap(det_state, passes, *args):
+            result_img, _status = _process_all(det_state, passes, *args)
             gallery_val = [result_img] if result_img is not None else []
             return gallery_val
 
         process_inputs = (
-            [detection_state]
+            [detection_state, passes_state]
             + det_enables
             + det_prompts
             + det_neg_prompts
@@ -893,8 +1284,9 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                 common_styles,
             ]
         )
+
         process_btn.click(
-            fn=lambda: gr.update(value="⏳ Processing…", interactive=False),
+            fn=lambda: gr.update(value="\u23f3 Processing\u2026", interactive=False),
             inputs=None,
             outputs=process_btn,
         ).then(
@@ -902,7 +1294,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             inputs=process_inputs,
             outputs=[output_gallery],
         ).then(
-            fn=lambda: gr.update(value="Process All Detections", interactive=True),
+            fn=lambda: gr.update(value="Process All Passes", interactive=True),
             inputs=None,
             outputs=process_btn,
         ).then(
@@ -911,7 +1303,8 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             outputs=result_tabs,
         )
 
-        # Save button
+        # -- Save button ------------------------------------------------
+
         def _save_from_gallery(gallery_images):
             if not gallery_images:
                 return gr.update(visible=False), "<p>No image to save.</p>"
@@ -925,7 +1318,8 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             outputs=[download_files, html_log],
         )
 
-        # Reuse button: send output back to input gallery
+        # -- Reuse button -----------------------------------------------
+
         def _reuse_output(gallery_images):
             if not gallery_images:
                 return gr.update()
@@ -943,7 +1337,8 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             outputs=main_tabs,
         )
 
-        # Send-to buttons: register via parameters_copypaste
+        # -- Send-to buttons --------------------------------------------
+
         for paste_tabname, paste_button in [
             ("img2img", send_img2img_btn),
             ("inpaint", send_inpaint_btn),
