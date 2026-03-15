@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any, Generic, Optional, TypeVar
 
 from huggingface_hub import hf_hub_download
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from rich import print  # noqa: A004  Shadowing built-in 'print'
 from torchvision.transforms.functional import to_pil_image
 
@@ -178,3 +179,66 @@ def ensure_pil_image(image: Any, mode: str = "RGB") -> Image.Image:
     if image.mode != mode:
         image = image.convert(mode)
     return image
+
+
+def color_for_label(label: str) -> tuple[int, int, int]:
+    palette = [
+        (230, 57, 70),
+        (29, 53, 87),
+        (69, 123, 157),
+        (42, 157, 143),
+        (244, 162, 97),
+        (233, 196, 106),
+        (38, 70, 83),
+        (142, 68, 173),
+        (39, 174, 96),
+        (241, 196, 15),
+        (52, 152, 219),
+        (231, 76, 60),
+    ]
+    digest = hashlib.md5(label.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(palette)
+    return palette[idx]
+
+
+def draw_detection_overlay(
+    image: Image.Image,
+    bboxes: list[list[float]] | list[list[int]],
+    masks: list[Image.Image] | None = None,
+    confidences: list[float] | None = None,
+    labels: list[str] | None = None,
+    colors: list[tuple[int, int, int]] | None = None,
+) -> Image.Image:
+    base = image.copy()
+    masks = masks or []
+
+    font = ImageFont.load_default()
+
+    for i, bbox in enumerate(bboxes):
+        color = None
+        if colors and i < len(colors):
+            color = colors[i]
+        elif labels and i < len(labels):
+            color = color_for_label(labels[i])
+        else:
+            color = (230, 57, 70)
+
+        if i < len(masks):
+            overlay = Image.new("RGB", base.size, color)
+            masked = Image.composite(overlay, base, masks[i])
+            base = Image.blend(base, masked, 0.25)
+
+        draw = ImageDraw.Draw(base)
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+        label = labels[i] if labels and i < len(labels) else None
+        if confidences and i < len(confidences):
+            score_text = f"{float(confidences[i]):.2f}"
+            label = f"{label} {score_text}" if label else f"det {score_text}"
+        if label:
+            text_pos = (min(x2 + 4, base.size[0] - 2), y1 + 2)
+            draw.text(text_pos, label, fill=color, font=font)
+
+    return base

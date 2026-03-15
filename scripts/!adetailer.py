@@ -40,6 +40,7 @@ from adetailer import (
     mediapipe_predict,
     ultralytics_predict,
 )
+from adetailer.auto_mapping import default_auto_mapping_json
 from adetailer.args import (
     BBOX_SORTBY,
     BUILTIN_SCRIPT,
@@ -49,7 +50,12 @@ from adetailer.args import (
     InpaintBBoxMatchMode,
     SkipImg2ImgOrig,
 )
-from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
+from adetailer.common import (
+    PredictOutput,
+    draw_detection_overlay,
+    ensure_pil_image,
+    safe_mkdir,
+)
 from adetailer.mask import (
     filter_by_ratio,
     filter_k_by,
@@ -253,7 +259,14 @@ class AfterDetailerScript(scripts.Script):
         if not all_inputs:
             msg = "[-] ADetailer: No valid arguments found."
             raise ValueError(msg)
+
         return all_inputs
+
+    @staticmethod
+    def get_output_overlay_flag(*args_) -> bool:
+        if len(args_) >= 3 and isinstance(args_[2], bool):
+            return args_[2]
+        return False
 
     def extra_params(self, arg_list: list[ADetailerArgs]) -> dict:
         params = {}
@@ -789,6 +802,8 @@ class AfterDetailerScript(scripts.Script):
             # case when img2img inpainting with skip img2img
             return
 
+        p._ad_output_overlay = self.get_output_overlay_flag(*args_)
+
         arg_list = self.get_args(p, *args_)
 
         if hasattr(p, "_ad_xyz_prompt_sr"):
@@ -843,6 +858,31 @@ class AfterDetailerScript(scripts.Script):
 
         masks = self.pred_preprocessing(p, pred, args)
         shared.state.assign_current_image(pred.preview)
+
+        if getattr(p, "_ad_output_overlay", False):
+            overlay_data = getattr(p, "_ad_overlay_collect", None)
+            if overlay_data is None:
+                overlay_data = {}
+                p._ad_overlay_collect = overlay_data
+
+            entry = overlay_data.get(i)
+            if entry is None:
+                base_image = getattr(p, "_ad_overlay_base", pp.image).copy()
+                entry = {
+                    "image": base_image,
+                    "bboxes": [],
+                    "masks": [],
+                    "confidences": [],
+                    "labels": [],
+                }
+                overlay_data[i] = entry
+
+            label = args.ad_model
+            count = len(pred.bboxes)
+            entry["bboxes"].extend(pred.bboxes)
+            entry["masks"].extend(pred.masks)
+            entry["confidences"].extend(pred.confidences)
+            entry["labels"].extend([label] * count)
 
         self.save_image(
             p,
@@ -900,6 +940,9 @@ class AfterDetailerScript(scripts.Script):
         pp.image = self.get_i2i_init_image(p, pp)
         pp.image = ensure_pil_image(pp.image, "RGB")
         init_image = copy(pp.image)
+        p._ad_output_overlay = self.get_output_overlay_flag(*args_)
+        if getattr(p, "_ad_output_overlay", False):
+            p._ad_overlay_base = init_image.copy()
         arg_list = self.get_args(p, *args_)
         params_txt_content = self.read_params_txt()
 
@@ -928,15 +971,128 @@ class AfterDetailerScript(scripts.Script):
 
         self.write_params_txt(params_txt_content)
 
+    def postprocess(self, p, processed, *args_):
+        overlay_data = getattr(p, "_ad_overlay_collect", None)
+        if not overlay_data:
+            return
+
+        base_prompt = processed.all_prompts[0] if processed.all_prompts else p.prompt
+        base_negative = (
+            processed.all_negative_prompts[0]
+            if processed.all_negative_prompts
+            else p.negative_prompt
+        )
+        base_seed = processed.all_seeds[0] if processed.all_seeds else p.seed
+        base_subseed = (
+            processed.all_subseeds[0] if processed.all_subseeds else p.subseed
+        )
+
+        for idx in sorted(overlay_data.keys()):
+            entry = overlay_data[idx]
+            image = draw_detection_overlay(
+                entry["image"],
+                entry["bboxes"],
+                entry["masks"],
+                entry["confidences"],
+                entry["labels"],
+            )
+
+            prompt = (
+                processed.all_prompts[idx]
+                if idx < len(processed.all_prompts)
+                else base_prompt
+            )
+            negative_prompt = (
+                processed.all_negative_prompts[idx]
+                if idx < len(processed.all_negative_prompts)
+                else base_negative
+            )
+            seed = processed.all_seeds[idx] if idx < len(processed.all_seeds) else base_seed
+            subseed = (
+                processed.all_subseeds[idx]
+                if idx < len(processed.all_subseeds)
+                else base_subseed
+            )
+
+            processed.images.append(image)
+            processed.all_prompts.append(prompt)
+            processed.all_negative_prompts.append(negative_prompt)
+            processed.all_seeds.append(seed)
+            processed.all_subseeds.append(subseed)
+            if hasattr(processed, "infotexts"):
+                processed.infotexts.append(self.infotext(p))
+
+        delattr(p, "_ad_overlay_collect")
+        if hasattr(p, "_ad_overlay_base"):
+            delattr(p, "_ad_overlay_base")
+        if hasattr(p, "_ad_output_overlay"):
+            delattr(p, "_ad_output_overlay")
+
 
 def on_after_component(component, **_kwargs):
     global txt2img_submit_button, img2img_submit_button
+    global _txt2img_gallery, _img2img_gallery
+    global _txt2img_send_adp_btn, _img2img_send_adp_btn
+
     if getattr(component, "elem_id", None) == "txt2img_generate":
         txt2img_submit_button = component
         return
 
     if getattr(component, "elem_id", None) == "img2img_generate":
         img2img_submit_button = component
+        return
+
+    # Capture output galleries for send-to-ADetailer+ wiring
+    if getattr(component, "elem_id", None) == "txt2img_gallery":
+        _txt2img_gallery = component
+        return
+
+    if getattr(component, "elem_id", None) == "img2img_gallery":
+        _img2img_gallery = component
+        return
+
+    # After the last send-to button in each output panel, create our
+    # native "Send to ADetailer+" ToolButton in the same Row context,
+    # then register it via parameters_copypaste so connect_paste_params_buttons
+    # wires it at the right time (inside the demo Blocks context).
+    if getattr(component, "elem_id", None) == "txt2img_send_to_extras":
+        from modules.ui_components import ToolButton
+        from modules.infotext_utils import register_paste_params_button, ParamBinding
+        _txt2img_send_adp_btn = ToolButton(
+            '\U0001F500', elem_id="txt2img_send_to_adetailer_plus",
+            tooltip="Send to ADetailer+",
+        )
+        if _txt2img_gallery is not None:
+            register_paste_params_button(ParamBinding(
+                paste_button=_txt2img_send_adp_btn,
+                tabname="adetailer_plus",
+                source_image_component=_txt2img_gallery,
+                paste_field_names=[],
+            ))
+        return
+
+    if getattr(component, "elem_id", None) == "img2img_send_to_extras":
+        from modules.ui_components import ToolButton
+        from modules.infotext_utils import register_paste_params_button, ParamBinding
+        _img2img_send_adp_btn = ToolButton(
+            '\U0001F500', elem_id="img2img_send_to_adetailer_plus",
+            tooltip="Send to ADetailer+",
+        )
+        if _img2img_gallery is not None:
+            register_paste_params_button(ParamBinding(
+                paste_button=_img2img_send_adp_btn,
+                tabname="adetailer_plus",
+                source_image_component=_img2img_gallery,
+                paste_field_names=[],
+            ))
+        return
+
+
+# Module-level vars for cross-tab wiring
+_txt2img_gallery = None
+_img2img_gallery = None
+_txt2img_send_adp_btn = None
+_img2img_send_adp_btn = None
 
 
 def on_ui_settings():
@@ -1056,6 +1212,7 @@ def on_ui_settings():
             "Strict is for SDXL only, and matches exactly to trained SDXL resolutions. Free works with any model, but will use potentially unsupported dimensions."
         ),
     )
+
 
 
 # xyz_grid
@@ -1208,7 +1365,15 @@ def add_api_endpoints(_: gr.Blocks, app: FastAPI):
         return {"ad_model": list(model_mapping)}
 
 
+def on_ui_tabs():
+    from aaaaaa.ui_advanced import create_advanced_tab
+
+    tab = create_advanced_tab(model_mapping)
+    return [(tab, "ADetailer+", "adetailer_advanced")]
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
 script_callbacks.on_app_started(add_api_endpoints)
 script_callbacks.on_before_ui(on_before_ui)
+script_callbacks.on_ui_tabs(on_ui_tabs)

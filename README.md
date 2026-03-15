@@ -63,6 +63,58 @@ API request example: [wiki/REST-API](https://github.com/Bing-su/adetailer/wiki/R
 
 `[SEP], [SKIP], [PROMPT]` tokens: [wiki/Advanced](https://github.com/Bing-su/adetailer/wiki/Advanced)
 
+## Auto mapping (opt-in)
+
+Use **“Auto fill tabs from main prompt”** in the ADetailer tab to auto-select models and
+prompts based on the main prompt. The mapping is defined by
+`default_auto_mapping_json()` in [adetailer/auto_mapping.py](adetailer/auto_mapping.py).
+
+Rules summary:
+
+- The main prompt is split by commas into phrases.
+- Phrases are matched to `keywords` (case-insensitive).
+- Each cluster produces a prompt from the matched phrases.
+- Clusters are applied to tabs in order, overriding `ad_model` and `ad_prompt`.
+
+Tip: This button populates the detector and prompt fields before generating.
+
+JSON schema (defined in `default_auto_mapping_json()`):
+
+- `global_keywords`: list of phrases included when `include_global` is true.
+- `clusters`: list of objects with:
+	- `name`: label for readability.
+	- `model`: model filename to use (must exist in the model list).
+	- `keywords`: list of phrases to match in the main prompt.
+	- `include_global`: include `global_keywords` phrases in this cluster.
+
+Example:
+
+```json
+{
+	"global_keywords": ["1girl", "1boy", "person"],
+	"clusters": [
+		{
+			"name": "face",
+			"model": "face_yolov8s.pt",
+			"keywords": ["face", "eyes", "mouth"],
+			"include_global": true
+		},
+		{
+			"name": "breasts",
+			"model": "breasts_seg.pt",
+			"keywords": ["breasts", "chest", "cleavage"],
+			"include_global": false
+		},
+		{
+			"name": "ass",
+			"model": "assdetailer-seg.pt",
+			"keywords": ["ass", "anus"],
+			"include_global": false
+		}
+	]
+}
+```
+
 ## Media
 
 - 🎥 [どこよりも詳しい After Detailer (adetailer)の使い方 ① 【Stable Diffusion】](https://youtu.be/sF3POwPUWCE)

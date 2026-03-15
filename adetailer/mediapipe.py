@@ -4,7 +4,7 @@ from functools import partial
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from adetailer import PredictOutput
 from adetailer.common import create_bbox_from_mask, create_mask_from_bbox
@@ -64,11 +64,19 @@ def mediapipe_face_detection(
         x2 = x1 + w
         y2 = y1 + h
 
-        confidences.append(detection.score)
+        score = detection.score[0] if isinstance(detection.score, list) else detection.score
+        confidences.append(float(score))
         bboxes.append([x1, y1, x2, y2])
 
     masks = create_mask_from_bbox(bboxes, image.size)
     preview = Image.fromarray(preview_array)
+    preview = draw_preview(
+        preview,
+        bboxes,
+        masks,
+        confidences=confidences,
+        labels=["face" for _ in bboxes],
+    )
 
     return PredictOutput(
         bboxes=bboxes, masks=masks, confidences=confidences, preview=preview
@@ -121,6 +129,13 @@ def mediapipe_face_mesh(
 
         bboxes = create_bbox_from_mask(masks, image.size)
         preview = Image.fromarray(preview)
+        preview = draw_preview(
+            preview,
+            bboxes,
+            masks,
+            confidences=confidences,
+            labels=["face_mesh" for _ in bboxes],
+        )
         return PredictOutput(
             bboxes=bboxes, masks=masks, confidences=confidences, preview=preview
         )
@@ -168,14 +183,25 @@ def mediapipe_face_mesh_eyes_only(
             confidences.append(1.0)  # Confidence is unknown
 
         bboxes = create_bbox_from_mask(masks, image.size)
-        preview = draw_preview(preview, bboxes, masks)
+        preview = draw_preview(
+            preview,
+            bboxes,
+            masks,
+            confidences=confidences,
+            labels=["eyes" for _ in bboxes],
+        )
         return PredictOutput(
             bboxes=bboxes, masks=masks, confidences=confidences, preview=preview
         )
 
 
 def draw_preview(
-    preview: Image.Image, bboxes: list[list[int]], masks: list[Image.Image]
+    preview: Image.Image,
+    bboxes: list[list[int]],
+    masks: list[Image.Image],
+    *,
+    confidences: list[float] | None = None,
+    labels: list[str] | None = None,
 ) -> Image.Image:
     red = Image.new("RGB", preview.size, "red")
     for mask in masks:
@@ -183,7 +209,17 @@ def draw_preview(
         preview = Image.blend(preview, masked, 0.25)
 
     draw = ImageDraw.Draw(preview)
-    for bbox in bboxes:
+    font = ImageFont.load_default()
+    for i, bbox in enumerate(bboxes):
         draw.rectangle(bbox, outline="red", width=2)
+        label = None
+        if labels and i < len(labels):
+            label = labels[i]
+        if confidences and i < len(confidences):
+            score = confidences[i]
+            label = f"{label or 'det'} {float(score):.2f}"
+        if label:
+            text_pos = (bbox[0] + 2, max(bbox[1] - 12, 0))
+            draw.text(text_pos, label, fill="red", font=font)
 
     return preview

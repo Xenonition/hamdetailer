@@ -10,6 +10,7 @@ import gradio as gr
 
 from aaaaaa.conditional import InputAccordion
 from adetailer import ADETAILER, __version__
+from adetailer.auto_mapping import build_auto_prompts, default_auto_mapping_json, load_auto_mapping
 from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
 
@@ -91,6 +92,46 @@ def on_generate_click(state: dict, *values: Any):
     return state
 
 
+def auto_map_from_prompt(prompt: str, num_outputs: int):
+    mapping = load_auto_mapping(default_auto_mapping_json())
+    if not mapping:
+        return [gr.update() for _ in range(num_outputs)]
+
+    auto_prompts = build_auto_prompts(prompt, mapping)
+    per_tab = 5
+    updates = [gr.update() for _ in range(num_outputs)]
+
+    tab_count = num_outputs // per_tab
+    for tab_index in range(tab_count):
+        base = tab_index * per_tab
+        updates[base] = gr.update(value="None")
+        updates[base + 1] = gr.update(value="")
+        updates[base + 2] = gr.update(value="Confidence")
+        updates[base + 3] = gr.update(value=1)
+        updates[base + 4] = gr.update(value="None")
+
+    if not auto_prompts:
+        return updates
+
+    for i, item in enumerate(auto_prompts):
+        base = i * per_tab
+        if base + 4 >= len(updates):
+            break
+        model_value = item.get("model")
+        updates[base] = gr.update(value=model_value)
+        updates[base + 1] = gr.update(value=item.get("prompt", ""))
+
+        if model_value == "nipples_v2_yolov11s-seg.pt":
+            updates[base + 3] = gr.update(value=2)
+            updates[base + 4] = gr.update(value="Merge")
+
+    return updates
+
+
+def clear_all_fields(defaults: list[Any]):
+    return [gr.update(value=value) for value in defaults]
+
+
 def on_ad_model_update(model: str):
     if "-world" in model:
         return gr.update(
@@ -126,6 +167,9 @@ def adui(
 ):
     states = []
     infotext_fields = []
+    model_prompt_outputs = []
+    clear_outputs = []
+    clear_defaults = []
     eid = partial(elem_id, n=0, is_img2img=is_img2img)
 
     with InputAccordion(
@@ -143,6 +187,29 @@ def adui(
                     elem_id=eid("ad_skip_img2img"),
                 )
 
+                ad_output_overlay = gr.Checkbox(
+                    label="Output detection overlay image",
+                    value=False,
+                    visible=True,
+                    elem_id=eid("ad_output_overlay"),
+                )
+
+                ad_auto_mapping_prompt = gr.Textbox(
+                    value="",
+                    visible=False,
+                    elem_id=eid("ad_auto_mapping_prompt"),
+                )
+
+                ad_auto_mapping_apply = gr.Button(
+                    value="Auto fill tabs from main prompt",
+                    elem_id=eid("ad_auto_mapping_apply"),
+                )
+
+                ad_clear_models = gr.Button(
+                    value="Clear all models",
+                    elem_id=eid("ad_clear_models"),
+                )
+
             with gr.Column(scale=1, min_width=180):
                 gr.Markdown(
                     f"v{__version__}",
@@ -155,7 +222,7 @@ def adui(
         with gr.Group(), gr.Tabs():
             for n in range(num_models):
                 with gr.Tab(ordinal(n + 1)):
-                    state, infofields = one_ui_group(
+                    state, infofields, model_prompt_pair, widgets = one_ui_group(
                         n=n,
                         is_img2img=is_img2img,
                         webui_info=webui_info,
@@ -163,9 +230,44 @@ def adui(
 
                 states.append(state)
                 infotext_fields.extend(infofields)
+                model_prompt_outputs.extend(model_prompt_pair)
+                for attr in ALL_ARGS.attrs:
+                    widget = getattr(widgets, attr)
+                    clear_outputs.append(widget)
+                    if attr == "ad_model":
+                        clear_defaults.append("None")
+                    elif attr in {"ad_model_classes", "ad_prompt", "ad_negative_prompt"}:
+                        clear_defaults.append("")
+                    else:
+                        clear_defaults.append(widget.value)
 
-    # components: [bool, bool, dict, dict, ...]
-    components = [ad_enable, ad_skip_img2img, *states]
+        tab = "img2img" if is_img2img else "txt2img"
+        prompt_selector = f"#{tab}_prompt textarea"
+        js = (
+            "() => {"
+            "const app = gradioApp();"
+            f"const prompt = app.querySelector('{prompt_selector}')?.value || '';"
+            "return [prompt];"
+            "}"
+        )
+
+        ad_auto_mapping_apply.click(
+            fn=partial(auto_map_from_prompt, num_outputs=len(model_prompt_outputs)),
+            inputs=[ad_auto_mapping_prompt],
+            outputs=model_prompt_outputs,
+            queue=False,
+            _js=js,
+        )
+
+        ad_clear_models.click(
+            fn=partial(clear_all_fields, defaults=clear_defaults),
+            inputs=[],
+            outputs=clear_outputs,
+            queue=False,
+        )
+
+    # components: [bool, bool, bool, dict, dict, ...]
+    components = [ad_enable, ad_skip_img2img, ad_output_overlay, *states]
     return components, infotext_fields
 
 
@@ -277,7 +379,13 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
 
     infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
 
-    return state, infotext_fields
+    return state, infotext_fields, (
+        w.ad_model,
+        w.ad_prompt,
+        w.ad_mask_filter_method,
+        w.ad_mask_k,
+        w.ad_mask_merge_invert,
+    ), w
 
 
 def detection(w: Widgets, n: int, is_img2img: bool):
