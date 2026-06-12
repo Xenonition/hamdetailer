@@ -804,15 +804,79 @@ class AfterDetailerScript(scripts.Script):
         self.write_params_txt(params_txt_content)
 
 
+# Module-level vars for cross-tab "Send to ADetailer+" wiring
+_txt2img_gallery = None
+_img2img_gallery = None
+_txt2img_send_adp_btn = None
+_img2img_send_adp_btn = None
+
+
 def on_after_component(component: gr.components.Component, **kwargs):
     if (eid := getattr(component, "elem_id", None)) is None:
         return
 
     global txt2img_submit_button, img2img_submit_button
+    global _txt2img_gallery, _img2img_gallery
+    global _txt2img_send_adp_btn, _img2img_send_adp_btn
+
     if eid == "txt2img_generate":
         txt2img_submit_button = component
+        return
     elif eid == "img2img_generate":
         img2img_submit_button = component
+        return
+
+    # Capture output galleries for send-to-ADetailer+ wiring
+    if eid == "txt2img_gallery":
+        _txt2img_gallery = component
+        return
+    if eid == "img2img_gallery":
+        _img2img_gallery = component
+        return
+
+    # After the last send-to button in each output panel, create our native
+    # "Send to ADetailer+" ToolButton in the same Row context, then register
+    # it via parameters_copypaste so connect_paste_params_buttons (called by
+    # the host inside the demo Blocks context) wires it at the right time.
+    if eid == "txt2img_send_to_extras":
+        from modules.infotext_utils import ParamBinding, register_paste_params_button
+        from modules.ui_components import ToolButton
+
+        _txt2img_send_adp_btn = ToolButton(
+            "\U0001F500",
+            elem_id="txt2img_send_to_adetailer_plus",
+            tooltip="Send to ADetailer+",
+        )
+        if _txt2img_gallery is not None:
+            register_paste_params_button(
+                ParamBinding(
+                    paste_button=_txt2img_send_adp_btn,
+                    tabname="adetailer_plus",
+                    source_image_component=_txt2img_gallery,
+                    paste_field_names=[],
+                )
+            )
+        return
+
+    if eid == "img2img_send_to_extras":
+        from modules.infotext_utils import ParamBinding, register_paste_params_button
+        from modules.ui_components import ToolButton
+
+        _img2img_send_adp_btn = ToolButton(
+            "\U0001F500",
+            elem_id="img2img_send_to_adetailer_plus",
+            tooltip="Send to ADetailer+",
+        )
+        if _img2img_gallery is not None:
+            register_paste_params_button(
+                ParamBinding(
+                    paste_button=_img2img_send_adp_btn,
+                    tabname="adetailer_plus",
+                    source_image_component=_img2img_gallery,
+                    paste_field_names=[],
+                )
+            )
+        return
 
 
 # region Settings
@@ -1086,7 +1150,15 @@ def add_api_endpoints(_: gr.Blocks, app: "FastAPI"):
         return {"ad_model": list(model_mapping)}
 
 
+def on_ui_tabs():
+    from lib_adetailer.ui_advanced import create_advanced_tab
+
+    tab = create_advanced_tab(model_mapping)
+    return [(tab, "ADetailer+", "adetailer_advanced")]
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
 script_callbacks.on_app_started(add_api_endpoints)
 script_callbacks.on_before_ui(on_before_ui)
+script_callbacks.on_ui_tabs(on_ui_tabs)

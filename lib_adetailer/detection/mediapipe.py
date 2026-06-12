@@ -2,7 +2,7 @@ import os
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from .common import PredictOutput, create_bbox_from_mask, create_mask_from_bbox
 
@@ -23,6 +23,9 @@ def _draw_preview(
     preview: Image.Image,
     bboxes: list[tuple[int, int, int, int]],
     masks: list[Image.Image],
+    *,
+    confidences: list[float] | None = None,
+    labels: list[str] | None = None,
 ) -> Image.Image:
     red = Image.new("RGB", preview.size, "red")
     for mask in masks:
@@ -30,8 +33,18 @@ def _draw_preview(
         preview = Image.blend(preview, masked, 0.25)
 
     draw = ImageDraw.Draw(preview)
-    for bbox in bboxes:
+    font = ImageFont.load_default()
+    for i, bbox in enumerate(bboxes):
         draw.rectangle(bbox, outline="red", width=2)
+        label = None
+        if labels and i < len(labels):
+            label = labels[i]
+        if confidences and i < len(confidences):
+            score = confidences[i]
+            label = f"{label or 'det'} {float(score):.2f}"
+        if label:
+            text_pos = (bbox[0] + 2, max(bbox[1] - 12, 0))
+            draw.text(text_pos, label, fill="red", font=font)
 
     return preview
 
@@ -80,7 +93,13 @@ def _mediapipe_face_mesh(
 
     bboxes = create_bbox_from_mask(masks, image.size)
 
-    preview = _draw_preview(preview, bboxes, masks)
+    preview = _draw_preview(
+        preview,
+        bboxes,
+        masks,
+        confidences=confidences,
+        labels=["face_mesh" for _ in bboxes],
+    )
 
     return PredictOutput(
         bboxes=bboxes,
@@ -122,10 +141,21 @@ def _mediapipe_face_detection(
         x2 = int(x1 + bbox.width)
         y2 = int(y1 + bbox.height)
 
-        confidences.append(detection.categories[0].score)
+        score = detection.categories[0].score
+        confidences.append(score)
         bboxes.append([x1, y1, x2, y2])
 
         cv2.rectangle(preview_array, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(
+            preview_array,
+            f"face {float(score):.2f}",
+            (x1 + 2, max(y1 - 6, 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
 
     masks = create_mask_from_bbox(bboxes, image.size)
     preview = Image.fromarray(preview_array)
