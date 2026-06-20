@@ -182,8 +182,8 @@ def _merge_bboxes(bboxes: list[list]) -> list:
 # ---------------------------------------------------------------------------
 
 _REGION_STYLE = """<style>
-.ad-adv-stage { position: relative; width: 100%; line-height: 0; user-select: none; }
-.ad-adv-stage > img { width: 100%; display: block; -webkit-user-drag: none; }
+.ad-adv-stage { position: relative; display: inline-block; max-width: 100%; max-height: 60vh; line-height: 0; user-select: none; }
+.ad-adv-stage > img { display: block; max-width: 100%; max-height: 60vh; width: auto; height: auto; -webkit-user-drag: none; }
 .ad-region {
     position: absolute; box-sizing: border-box;
     border: 2px solid var(--rc, #e63946); border-radius: 3px;
@@ -338,13 +338,14 @@ def _run_detection(
     Returns a flat output list consumed by Gradio::
 
         [region_overlay_html, detection_state,
-         selection_panel_visible, selection_state_reset, selection_status_reset,
+         selection_panel_visible, input_gallery_visible,
+         selection_state_reset, selection_status_reset,
          passes_state_reset, passes_html_reset,
          *accordion_hidden(xN), *enable_reset(xN), *mask_preview_reset(xN),
          *prompt_reset(xN), *neg_prompt_reset(xN),
          *denoise_reset(xN), *blur_reset(xN), *dilate_reset(xN)]
 
-    Total length: 7 + 8*MAX_PASSES
+    Total length: 8 + 8*MAX_PASSES
     """
     if isinstance(models_selected, str):
         models_selected = [models_selected]
@@ -356,6 +357,7 @@ def _run_detection(
     empty: list[Any] = (
         ["", None]                                        # region_overlay, state
         + [gr.update(visible=False)]                      # selection panel
+        + [gr.update(visible=True)]                       # input gallery stays visible
         + [[]]                                            # selection_state reset
         + [""]                                            # selection_status reset
         + [[]]                                            # passes_state reset
@@ -450,6 +452,7 @@ def _run_detection(
     return (
         [overlay_html, state]                             # region_overlay, state
         + [gr.update(visible=True)]                       # selection panel visible
+        + [gr.update(visible=False)]                      # hide input gallery
         + [[]]                                            # selection_state reset
         + [""]                                            # selection_status reset
         + [[]]                                            # passes_state reset
@@ -643,9 +646,15 @@ def _clear_passes(detection_state: dict | None):
     Clear all passes and the current selection.
 
     Returns: [passes_state, selection_state, region_overlay_html,
-              passes_display_html, selection_status_html]
+              passes_display_html, selection_status_html, input_gallery_visible]
+
+    Unlike _add_pass / _auto_one_per_detection (which keep the upload gallery
+    hidden), clearing passes re-shows it so the user can swap the source image.
     """
-    return [], [], _render_region_overlay(detection_state, [], []), "", ""
+    return (
+        [], [], _render_region_overlay(detection_state, [], []), "", "",
+        gr.update(visible=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1083,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                     # -- right: input image + preview -----------
                     with gr.Column(scale=1, elem_id="ad_adv_input_col"):
                         with gr.Column(variant="panel"):
-                            with gr.Group():
+                            with gr.Group(visible=True) as input_image_group:
                                 input_image = gr.Gallery(
                                     label="Input Image",
                                     show_label=False,
@@ -1110,9 +1119,14 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                 "adetailer_plus", _hidden_input, [], None
             )
             _hidden_input.change(
-                fn=lambda img: [img] if img is not None else [],
+                # Forward the pasted PIL into the Gallery AND re-show the gallery
+                # group, so a send-to after a prior detection isn't stuck hidden.
+                fn=lambda img: (
+                    [img] if img is not None else [],
+                    gr.update(visible=True),
+                ),
                 inputs=[_hidden_input],
-                outputs=[input_image],
+                outputs=[input_image, input_image_group],
                 show_progress=False,
             )
 
@@ -1315,6 +1329,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         detect_outputs = (
             [region_overlay, detection_state]
             + [selection_panel]
+            + [input_image_group]     # hide on success, show otherwise
             + [selection_state]       # reset in-progress selection
             + [selection_status]      # reset status line
             + [passes_state]
@@ -1380,7 +1395,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         clear_passes_btn.click(
             fn=_clear_passes,
             inputs=[detection_state],
-            outputs=pass_outputs,
+            outputs=[*pass_outputs, input_image_group],
         )
 
         # -- Confirm passes -> populate accordions -----------------------
