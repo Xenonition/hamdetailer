@@ -1,0 +1,78 @@
+Python 3.13.12 (main, Feb  3 2026, 22:53:26) [MSC v.1944 64 bit (AMD64)]
+Version: neo
+C:\Users\PC\AppData\Roaming\StabilityMatrix\Packages\Stable Diffusion WebUI Forge - Neo\extensions\sd-webui-infinite-image-browsing\install.py:3: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+  import pkg_resources
+Launching Web UI with arguments: --pin-shared-memory --cuda-malloc --cuda-stream --skip-python-version-check --gradio-allowed-path 'C:\Users\PC\AppData\Roaming\StabilityMatrix\Images'
+Total VRAM 16311 MB, total RAM 48991 MB        memory_management.py :: INFO    
+PyTorch Version: 2.10.0+cu130                  memory_management.py :: INFO    
+VRAM State: NORMAL_VRAM                        memory_management.py :: INFO    
+Device: NVIDIA GeForce RTX 5060 Ti (cuda:0) -  memory_management.py :: INFO    
+cudaMallocAsync                                                                
+Using async weight offloading with 2 streams   memory_management.py :: INFO    
+Pinned Memory: 22046 MB                        memory_management.py :: INFO    
+Using SageAttention 2                                  attention.py :: INFO    
+Using PyTorch Attention for VAE                        attention.py :: INFO    
+============================================================================
+You are running PyTorch 2.10.0+cu130, which is outdated.
+
+Delete the venv folder to do a reinstall is recommended.
+Use --skip-version-check commandline argument to disable the version checks.
+============================================================================
+ControlNet preprocessor location: C:\Users\PC\AppData\Roaming\StabilityMatrix\Packages\Stable Diffusion WebUI Forge - Neo\models\ControlNetPreprocessor
+Tag Autocomplete: Could not locate model-keyword extension, Lora trigger word completion will be limited to those added through the extra networks menu.
+[-] ADetailer initialized. version: 26.2.0, num models: 49
+[ForgeCouple] - INFO - Loaded Adv. Presets...
+[Vec. CC] Style Sheet Loaded...
+ControlNet UI callback registered.           controlnet_ui_group.py :: INFO    
+Model Selected:                                       main_entry.py :: INFO    
+{
+  "checkpoint": "animaOfficial_preview3Base.safetensors",
+  "modules": [
+    "qwen_image_vae.safetensors",
+    "qwen_3_06b_base.safetensors"
+  ],
+  "dtype": "[torch.float16, torch.bfloat16]"
+}
+Patch LoRAs on-the-fly: False                         main_entry.py :: INFO    
+Running on local URL:  http://127.0.0.1:7860
+
+To create a public link, set `share=True` in `launch()`.
+IIB Database file has been successfully backed up to the backup folder.
+Startup time: 21.4s (prepare environment: 3.9s, launcher: 0.3s, forge init: 4.2s, shared init: 0.1s, misc. imports: 3.3s, setup gfpgan: 0.2s, load scripts: 4.4s, create ui: 3.0s, gradio launch: 1.9s, app_started_callback: 0.1s).
+Loading Model: {'checkpoint_info': {'filename': 'C:\\Users\\PC\\AppData\\Roaming\\StabilityMatrix\\Packages\\Stable Diffusion WebUI Forge - Neo\\models\\Stable-diffusion\\sd\\animaOfficial_preview3Base.safetensors', 'hash': '0ad5998f'}, 'additional_modules': ['C:\\Users\\PC\\AppData\\Roaming\\StabilityMatrix\\Packages\\Stable Diffusion WebUI Forge - Neo\\models\\VAE\\qwen_image_vae.safetensors', 'C:\\Users\\PC\\AppData\\Roaming\\StabilityMatrix\\Packages\\Stable Diffusion WebUI Forge - Neo\\models\\text_encoder\\qwen_3_06b_base.safetensors'], 'unet_storage_dtype': None}
+Using Default Qwen3 Data Type: torch.float16              loader.py :: INFO    
+Using Default Model Data Type: torch.bfloat16             loader.py :: INFO    
+Diffusion Model: {storage: torch.bfloat16, computation:  k_model.py :: INFO    
+torch.bfloat16}                                                                
+tag_autocomplete_helper: Old webui version or unrecognized model shape, using fallback for embedding completion.
+Model loaded in 2.2s (unload existing model: 0.3s, forge model load: 1.8s).
+[LORA] LoRA mismatch for KModel:                        networks.py :: WARNING 
+C:\Users\PC\AppData\Roaming\StabilityMatrix\Packages\St                        
+able Diffusion WebUI Forge -                                                   
+Neo\models\Lora\IronClad-X-Silent-V1.1A_epoch_14.safete                        
+nsors                                                                          
+Requested to load JointTextEncoder             memory_management.py :: INFO    
+loaded completely; 13640.80 MB usable, 1753.23 MB loaded,   base.py :: INFO    
+full load: True                                                                
+Moving model(s) has taken 0.48 seconds         memory_management.py :: INFO    
+Requested to load KModel                       memory_management.py :: INFO    
+loaded completely; 11837.46 MB usable, 3731.55 MB loaded,   base.py :: INFO    
+full load: True                                                                
+Moving model(s) has taken 0.96 seconds         memory_management.py :: INFO    
+100%|██████████| 24/24 [00:21<00:00,  1.12it/s]
+Requested to load WanVAE                       memory_management.py :: INFO    
+loaded completely; 4574.75 MB usable, 242.03 MB loaded,     base.py :: INFO    
+full load: True                                                                
+Encountered NaN in Latent                             processing.py :: WARNING 
+If you are using SageAttention, try --disable-sage                             
+
+0: 640x512 (no detections), 26.9ms
+Speed: 14.0ms preprocess, 26.9ms inference, 0.7ms postprocess per image at shape (1, 3, 640, 512)
+[-] ADetailer: nothing detected on image 1 with 1st settings.
+100%|██████████| 24/24 [00:21<00:00,  1.10it/s]
+Encountered NaN in Latent                             processing.py :: WARNING 
+If you are using SageAttention, try --disable-sage                             
+
+0: 640x512 (no detections), 8.5ms
+Speed: 2.1ms preprocess, 8.5ms inference, 0.6ms postprocess per image at shape (1, 3, 640, 512)
+[-] ADetailer: nothing detected on image 1 with 1st settings.

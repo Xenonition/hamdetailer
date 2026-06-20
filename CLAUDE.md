@@ -4,7 +4,7 @@
 
 ADetailer is a Stable Diffusion WebUI extension for automatic face/body/object detection and inpainting. This fork adds **ADetailer+**, a standalone top-level tab with an interactive detect→customize→process workflow.
 
-**Host**: SD WebUI Forge (Gradio 3.x based)
+**Host**: SD WebUI Forge ("Neo"), **Gradio 4.40.0** (verify with `venv/Lib/site-packages/gradio-4.40.0.dist-info`; an older note said "3.x" — that was stale)
 **Location**: `<webui>/extensions/adetailer/`
 **Base/upstream**: rebased onto [ADetailer-Neo](https://github.com/Haoming02/ADetailer-Neo) (`upstream` remote). Neo renamed the core package `adetailer/` → `lib_adetailer/`, moved WebUI-integration helpers into `lib_adetailer/utils/`, and renamed `scripts/!adetailer.py` → `scripts/adetailer.py`.
 
@@ -48,8 +48,8 @@ javascript/
 
 ### Workflow
 
-1. **Detect**: Run models → preview with bounding boxes, selection panel appears
-2. **Select**: CheckboxGroup shows all detections; user checks items + clicks "Add Pass" to group them into an inpaint pass (repeat for multiple passes)
+1. **Detect**: Run models → interactive overlay (`region_overlay`) showing the image with one clickable region per detection; selection panel appears
+2. **Select**: Click regions on the image to toggle them into the current pass (`selection_state`), then click "Add Pass" to group them (repeat for multiple passes)
 3. **Confirm**: Masks within each pass are union-merged; accordions are populated on the Inpainting tab (one per pass)
 4. **Process**: Each pass is inpainted sequentially with its merged mask
 
@@ -76,7 +76,7 @@ Merged bbox = bounding box of the union (min x1/y1, max x2/y2 across constituent
 **Three flat return lists** must stay in sync:
 
 1. `_run_detection()` returns `7 + 8×MAX_PASSES` items:
-   `[preview, state, selection_panel_vis, thumbnails, checkbox_update, passes_reset, passes_html, *accordion×N, *enable×N, *mask×N, *prompt×N, *neg×N, *denoise×N, *blur×N, *dilate×N]`
+   `[region_overlay_html, state, selection_panel_vis, selection_reset, selection_status_reset, passes_reset, passes_html, *accordion×N, *enable×N, *mask×N, *prompt×N, *neg×N, *denoise×N, *blur×N, *dilate×N]`
    Must match `detect_outputs`.
 
 2. `_confirm_passes()` returns `8×MAX_PASSES` items:
@@ -88,18 +88,41 @@ Merged bbox = bounding box of the union (min x1/y1, max x2/y2 across constituent
 
 **CRITICAL**: When adding new per-pass fields, update ALL THREE return lists AND their corresponding output/input component lists.
 
+### Interactive Region Overlay (click-to-select)
+
+The right column of the Detection tab is `region_overlay` (a `gr.HTML`), built by
+`_render_region_overlay(detection_state, selection_indices, passes)`:
+- Base image embedded as a base64 `data:` URI (cached in `detection_state["data_uri"]`
+  + `width`/`height` at detection time — never re-encoded per click).
+- One absolutely-positioned `<div class="ad-region" data-idx=i onclick="adAdvPickRegion(i)">`
+  per detection, sized in **percentages** of the image (responsive, no JS resize).
+  Smaller boxes are emitted last so they sit on top and stay clickable.
+- Each region floats a `[i] name conf` label and highlights on CSS `:hover`.
+  States: available / `selected` (✓) / `assigned` (locked, shows `Pass N`,
+  `pointer-events:none`). CSS lives in the `_REGION_STYLE` constant.
+
+Click plumbing: `adAdvPickRegion(idx)` (in `javascript/adetailer_plus.js`) writes
+`"<idx>|<nonce>"` into the hidden `region_click` textbox and fires its `input`
+event. The nonce defeats Gradio's "value unchanged ⇒ no `.change`" suppression so
+repeated clicks of the same region register. `region_click.change` →
+`_on_region_click` toggles the index in `selection_state` and re-renders the overlay.
+
 ### Selection Panel
 
 Located on the Detection tab (below detect controls), hidden until detection runs.
 Contains:
-- `det_thumbnails` — Gallery of per-detection mask overlays
-- `det_checkbox_group` — CheckboxGroup with labels like `"[1] face_yolov8n — 0.95"`
+- `selection_state` (`gr.State`) — in-progress selection (detection indices for the
+  pass being built); driven entirely by clicks on `region_overlay`
 - **Add Pass** / **Auto: 1 per detection** / **Clear Passes** buttons
 - `passes_display` — HTML showing current pass assignments
+- `selection_status` — HTML readout of the current selection
 - **Confirm & Continue** button
 
-Detections assigned to a pass are removed from checkbox choices (no double-assignment).
-"Auto: 1 per detection" creates one pass per remaining unassigned detection.
+All pass-building callbacks (`_add_pass`, `_auto_one_per_detection`, `_clear_passes`)
+share one output convention:
+`[passes_state, selection_state, region_overlay, passes_display, selection_status]`.
+Detections assigned to a pass become `assigned` (locked) on the overlay (no
+double-assignment). "Auto: 1 per detection" creates one pass per unassigned detection.
 
 ### Cross-Tab Send-To Buttons
 
@@ -200,6 +223,6 @@ Neo's `ultralytics_predict` (in `lib_adetailer/detection/ultralytics.py`) loads 
 
 5. **elem_id naming for tag autocomplete** — If you rename elem_ids on prompt/neg textboxes, update the CSS selectors in `a1111-sd-webui-tagcomplete/javascript/_textAreas.js`.
 
-6. **Gradio 3.x** — Forge uses Gradio 3.x, not 4.x. Use `gr.update(...)` not component constructors for updates. `InputAccordion` is a WebUI custom component, not upstream Gradio.
+6. **Gradio 4.40.0** — Forge Neo runs Gradio 4.40, not 3.x. Prefer `gr.update(...)` for updates. `InputAccordion` is a WebUI custom component, not upstream Gradio. `gr.HTML` renders raw HTML and inline `onclick` attributes execute (used by the region overlay).
 
-7. **CheckboxGroup choices tracking** — When adding a pass, `_add_pass_wrapper` rebuilds available choices from `detection_state` minus already-assigned indices, because Gradio 3.x CheckboxGroup only provides the selected values (not the current choices list) as input.
+7. **`region_click` nonce** — The overlay's click bridge appends `|<Date.now()>` to the value it writes into `region_click`, otherwise Gradio suppresses `.change` when the same region is clicked twice. `_on_region_click` strips the nonce with `raw.split("|", 1)[0]`. Keep both halves in sync if you touch either.

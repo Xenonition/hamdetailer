@@ -5,9 +5,10 @@ Adds a top-level "ADetailer+" tab to the WebUI with the following workflow:
 
 1. Upload / send an image
 2. Select one or more detection (seg) models
-3. Click **Run Detection** → preview with bounding boxes, masks, labels
-4. **Selection panel** appears with numbered thumbnails + CheckboxGroup
-5. User iteratively builds **passes**: check detections → *Add Pass* → repeat
+3. Click **Run Detection** → interactive overlay: the image with one clickable
+   region per detection (floating ``name conf`` label, hover highlight)
+4. **Selection panel** appears; click regions to add them to the current pass
+5. User iteratively builds **passes**: click detections → *Add Pass* → repeat
 6. Click **Confirm & Continue** → switches to Inpainting tab with one accordion
    per pass (masks within a pass are union-merged)
 7. Click **Process** → standard img2img inpainting per pass
@@ -37,17 +38,26 @@ Implementation Notes
 **UI structure**:
     Two-tab layout inside a top-level ``gr.Blocks``:
     - *Detection tab*  — left: model selector + detect button + selection panel,
-      right: input Gallery (top), detection preview Gallery (bottom, after detect)
+      right: input Gallery (top), interactive ``region_overlay`` (bottom)
     - *Inpainting tab* — left: common settings + N InputAccordions (one per pass),
       right: Output sub-tab.  Auto-switches to Output after processing.
 
+**Interactive overlay** (``region_overlay``, a ``gr.HTML``):
+    ``_render_region_overlay()`` builds an image-map: the base image (cached as a
+    base64 ``data:`` URI in ``detection_state``) with one absolutely-positioned
+    ``<div class="ad-region">`` per detection (percentage coords ⇒ responsive).
+    Each region floats a ``[i] name conf`` label, highlights on CSS ``:hover``,
+    and on click invokes the ``adAdvPickRegion(idx)`` JS hook
+    (``javascript/adetailer_plus.js``) which writes ``"<idx>|<nonce>"`` into the
+    hidden ``region_click`` textbox to fire ``_on_region_click``.
+
 **Selection panel** (on Detection tab, shown after detect):
-    - ``det_thumbnails`` — ``gr.Gallery`` showing per-detection mask overlay
-      thumbnails numbered [1], [2], …
-    - ``det_checkbox_group`` — ``gr.CheckboxGroup`` with labels like
-      ``"[1] face_yolov8n — 0.95"``
+    - ``selection_state`` — ``gr.State`` of the in-progress selection (detection
+      indices for the pass being built); clicked regions toggle in/out and are
+      shown highlighted on the overlay
     - *Add Pass* button, *Auto: 1 per detection* shortcut, *Clear Passes* button
     - ``passes_display`` — ``gr.HTML`` showing current pass assignments
+    - ``selection_status`` — ``gr.HTML`` readout of the current selection
     - *Confirm & Continue* button
 
 **Flat return lists for Gradio**:
@@ -87,6 +97,8 @@ Implementation Notes
 
 from __future__ import annotations
 
+import base64
+import io
 import platform
 from copy import copy
 from typing import Any
@@ -98,7 +110,7 @@ from rich import print  # noqa: A004
 
 from lib_adetailer import __version__, mediapipe_predict, ultralytics_predict
 from lib_adetailer.args import INPAINT_BBOX_MATCH_MODES, InpaintBBoxMatchMode
-from lib_adetailer.detection.common import PredictOutput, draw_detection_overlay
+from lib_adetailer.detection.common import PredictOutput, color_for_label
 from lib_adetailer.mask import dilate_erode, mask_merge
 from lib_adetailer.opts import OptimalCropSize
 from lib_adetailer.utils import ensure_pil_image
@@ -131,32 +143,6 @@ def _get_ultralytics_device() -> str:
     return ""
 
 
-def _make_mask_preview(
-    source: Image.Image,
-    mask: Image.Image,
-    bbox: list,
-    label: str,
-    conf: float,
-) -> Image.Image:
-    """Overlay a single detection mask on the source for preview."""
-    preview = source.copy()
-    overlay = Image.new("RGB", preview.size, (230, 57, 70))
-    masked = Image.composite(overlay, preview, mask)
-    preview = Image.blend(preview, masked, 0.4)
-
-    draw = ImageDraw.Draw(preview)
-    x1, y1, x2, y2 = (int(v) for v in bbox)
-    draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-    font = ImageFont.load_default()
-    draw.text(
-        (x1 + 2, max(y1 - 14, 0)),
-        f"{label} {conf:.2f}",
-        fill="red",
-        font=font,
-    )
-    return preview
-
-
 def _make_merged_mask_preview(
     source: Image.Image,
     merged_mask: Image.Image,
@@ -182,11 +168,6 @@ def _make_merged_mask_preview(
     return preview
 
 
-def _det_choice_label(index: int, label: str, conf: float) -> str:
-    """Build a CheckboxGroup choice label for a detection."""
-    return f"[{index + 1}] {label} \u2014 {conf:.2f}"
-
-
 def _merge_bboxes(bboxes: list[list]) -> list:
     """Compute the bounding box of the union of multiple bboxes."""
     x1 = min(b[0] for b in bboxes)
@@ -194,6 +175,139 @@ def _merge_bboxes(bboxes: list[list]) -> list:
     x2 = max(b[2] for b in bboxes)
     y2 = max(b[3] for b in bboxes)
     return [x1, y1, x2, y2]
+
+
+# ---------------------------------------------------------------------------
+#  Interactive region overlay (click-to-select)
+# ---------------------------------------------------------------------------
+
+_REGION_STYLE = """<style>
+.ad-adv-stage { position: relative; width: 100%; line-height: 0; user-select: none; }
+.ad-adv-stage > img { width: 100%; display: block; -webkit-user-drag: none; }
+.ad-region {
+    position: absolute; box-sizing: border-box;
+    border: 2px solid var(--rc, #e63946); border-radius: 3px;
+    cursor: pointer; transition: background-color .1s ease, box-shadow .1s ease;
+}
+.ad-region:hover { background-color: var(--rcf, rgba(230,57,70,.32)); }
+.ad-region.selected {
+    background-color: var(--rcf, rgba(46,204,113,.32));
+    border-color: #2ecc71; border-width: 3px; box-shadow: 0 0 0 1px #2ecc71;
+}
+.ad-region.assigned {
+    border-style: dashed; border-color: #999;
+    background-color: rgba(130,130,130,.28); cursor: default; pointer-events: none;
+}
+.ad-region-label {
+    position: absolute; left: -2px; top: -1.45em; white-space: nowrap;
+    font-size: 12px; line-height: 1.35; padding: 0 5px; border-radius: 3px;
+    color: #fff; background: var(--rc, #e63946); font-weight: 600;
+    pointer-events: none; box-shadow: 0 1px 2px rgba(0,0,0,.4);
+}
+.ad-region-label.label-inside { top: 2px; left: 2px; }
+.ad-region.selected .ad-region-label { background: #2ecc71; }
+.ad-region.assigned .ad-region-label { background: #888; }
+</style>"""
+
+
+def _esc(text) -> str:
+    """Minimal HTML-escape for label text injected into the overlay."""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _bbox_area(bbox: list) -> float:
+    return max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
+
+
+def _img_to_data_uri(arr) -> str:
+    """Encode a numpy array / PIL image to a base64 PNG ``data:`` URI."""
+    img = arr if isinstance(arr, Image.Image) else Image.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _render_region_overlay(
+    detection_state: dict | None,
+    selected_indices: list | None,
+    passes: list | None,
+) -> str:
+    """Build the interactive HTML overlay: base image + one clickable div per
+    detection. Regions already assigned to a pass are locked; the current
+    selection is highlighted. Smaller boxes are emitted last so they sit on top
+    of larger overlapping ones and stay clickable."""
+    if not detection_state:
+        return ""
+
+    data_uri = detection_state.get("data_uri") or _img_to_data_uri(
+        detection_state["source"]
+    )
+    W = detection_state.get("width") or detection_state["source"].shape[1]
+    H = detection_state.get("height") or detection_state["source"].shape[0]
+    n = detection_state["n"]
+    bboxes = detection_state["bboxes"]
+    labels = detection_state["labels"]
+    confidences = detection_state["confidences"]
+    selected = set(selected_indices or [])
+
+    assigned: dict[int, int] = {}
+    for pass_num, p in enumerate(passes or [], start=1):
+        for idx in p["det_indices"]:
+            assigned[idx] = pass_num
+
+    order = sorted(range(n), key=lambda i: _bbox_area(bboxes[i]), reverse=True)
+
+    parts = [
+        _REGION_STYLE,
+        f'<div class="ad-adv-stage"><img src="{data_uri}" draggable="false"/>',
+    ]
+    for i in order:
+        x1, y1, x2, y2 = (float(v) for v in bboxes[i])
+        left = max(0.0, x1) / W * 100.0
+        top = max(0.0, y1) / H * 100.0
+        w = (x2 - x1) / W * 100.0
+        h = (y2 - y1) / H * 100.0
+        r, g, b = color_for_label(labels[i])
+
+        if i in assigned:
+            state = "assigned"
+            text = f"Pass {assigned[i]}: [{i + 1}] {labels[i]}"
+            onclick = ""
+        elif i in selected:
+            state = "selected"
+            text = f"✓ [{i + 1}] {labels[i]} {confidences[i]:.2f}"
+            onclick = f' onclick="adAdvPickRegion({i})"'
+        else:
+            state = ""
+            text = f"[{i + 1}] {labels[i]} {confidences[i]:.2f}"
+            onclick = f' onclick="adAdvPickRegion({i})"'
+
+        label_inside = " label-inside" if top < 7.0 else ""
+        style = (
+            f"left:{left:.3f}%;top:{top:.3f}%;width:{w:.3f}%;height:{h:.3f}%;"
+            f"--rc:rgb({r},{g},{b});--rcf:rgba({r},{g},{b},0.32);"
+        )
+        parts.append(
+            f'<div class="ad-region {state}" data-idx="{i}" style="{style}"{onclick}>'
+            f'<span class="ad-region-label{label_inside}">{_esc(text)}</span></div>'
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _render_selection_status(selected_indices: list | None, detection_state: dict | None) -> str:
+    """Textual readout of the in-progress selection (the pass being built)."""
+    if not selected_indices or not detection_state:
+        return ""
+    labels = detection_state["labels"]
+    parts = [f"[{i + 1}] {labels[i]}" for i in sorted(selected_indices)]
+    return f"<p><b>Current selection:</b> {', '.join(parts)}</p>"
 
 
 def _render_passes_html(passes: list) -> str:
@@ -223,8 +337,8 @@ def _run_detection(
 
     Returns a flat output list consumed by Gradio::
 
-        [preview_gallery, detection_state,
-         selection_panel_visible, det_thumbnails, checkbox_choices_update,
+        [region_overlay_html, detection_state,
+         selection_panel_visible, selection_state_reset, selection_status_reset,
          passes_state_reset, passes_html_reset,
          *accordion_hidden(xN), *enable_reset(xN), *mask_preview_reset(xN),
          *prompt_reset(xN), *neg_prompt_reset(xN),
@@ -240,10 +354,10 @@ def _run_detection(
     N = MAX_PASSES
     # Defaults - nothing detected; hide selection panel and all accordions
     empty: list[Any] = (
-        [None, None]                                      # preview, state
+        ["", None]                                        # region_overlay, state
         + [gr.update(visible=False)]                      # selection panel
-        + [None]                                          # thumbnails gallery
-        + [gr.update(choices=[], value=[])]               # checkbox
+        + [[]]                                            # selection_state reset
+        + [""]                                            # selection_status reset
         + [[]]                                            # passes_state reset
         + [""]                                            # passes_html reset
         + [gr.update(visible=False)] * N                  # accordions
@@ -259,11 +373,16 @@ def _run_detection(
     if image is None:
         return empty
 
+    image = ensure_pil_image(image, "RGB")
+    bare_overlay = (
+        f'{_REGION_STYLE}<div class="ad-adv-stage">'
+        f'<img src="{_img_to_data_uri(image)}" draggable="false"/></div>'
+    )
+
     if not models_selected:
-        empty[0] = [image]
+        empty[0] = bare_overlay
         return empty
 
-    image = ensure_pil_image(image, "RGB")
     device = _get_ultralytics_device()
 
     all_bboxes: list[list] = []
@@ -300,7 +419,7 @@ def _run_detection(
             all_labels.extend([model_name] * len(pred.bboxes))
 
     if not all_bboxes:
-        empty[0] = [image]
+        empty[0] = bare_overlay
         return empty
 
     total_found = len(all_bboxes)
@@ -310,24 +429,14 @@ def _run_detection(
     all_confidences = all_confidences[:n]
     all_labels = all_labels[:n]
 
-    # Overall preview with all detections drawn
-    preview = draw_detection_overlay(
-        image, all_bboxes, all_masks, all_confidences, all_labels
-    )
-
-    # Per-detection thumbnails for selection gallery
-    thumbnails = []
-    checkbox_choices = []
-    for i in range(n):
-        thumb = _make_mask_preview(
-            image, all_masks[i], all_bboxes[i], all_labels[i], all_confidences[i]
-        )
-        thumbnails.append(thumb)
-        checkbox_choices.append(_det_choice_label(i, all_labels[i], all_confidences[i]))
-
-    # State stored as numpy for safe gr.State serialisation
+    # State stored as numpy for safe gr.State serialisation.  ``data_uri`` and
+    # ``width``/``height`` are cached so per-click overlay re-renders never need
+    # to re-encode the source image.
     state = {
         "source": np.array(image),
+        "width": image.width,
+        "height": image.height,
+        "data_uri": _img_to_data_uri(image),
         "n": n,
         "bboxes": [list(b) for b in all_bboxes],
         "masks": [np.array(m) for m in all_masks],
@@ -335,12 +444,14 @@ def _run_detection(
         "labels": all_labels,
     }
 
+    overlay_html = _render_region_overlay(state, [], [])
+
     N = MAX_PASSES
     return (
-        [[preview], state]                                # preview gallery, state
+        [overlay_html, state]                             # region_overlay, state
         + [gr.update(visible=True)]                       # selection panel visible
-        + [thumbnails]                                    # thumbnails gallery
-        + [gr.update(choices=checkbox_choices, value=[])] # checkbox choices reset
+        + [[]]                                            # selection_state reset
+        + [""]                                            # selection_status reset
         + [[]]                                            # passes_state reset
         + [""]                                            # passes_html reset
         + [gr.update(visible=False)] * N                  # hide all accordions
@@ -358,59 +469,106 @@ def _run_detection(
 #  Pass-building callbacks
 # ---------------------------------------------------------------------------
 
-def _add_pass(
-    passes: list,
-    selected_labels: list[str],
+# All pass-building / selection callbacks share this output convention::
+#
+#     [passes_state, selection_state, region_overlay_html,
+#      passes_display_html, selection_status_html]
+
+
+def _on_region_click(
+    raw: str,
+    selected: list | None,
     detection_state: dict | None,
-    all_choices: list[str],
+    passes: list | None,
 ):
     """
-    Add a new pass from the currently checked detections.
+    Toggle the clicked detection in/out of the in-progress selection.
 
-    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    ``raw`` is ``"<idx>|<nonce>"`` written by the ``adAdvPickRegion`` JS hook;
+    the nonce guarantees Gradio fires ``.change`` even on repeated clicks of the
+    same region.
+
+    Returns: [selection_state, region_overlay_html, selection_status_html]
     """
-    if detection_state is None:
-        return passes, gr.update(), _render_passes_html(passes), ""
+    selected = list(selected or [])
+    if detection_state is None or not raw:
+        return selected, _render_region_overlay(detection_state, selected, passes), \
+            _render_selection_status(selected, detection_state)
 
-    if not selected_labels:
+    try:
+        idx = int(str(raw).split("|", 1)[0])
+    except (ValueError, TypeError):
+        idx = -1
+
+    used = set()
+    for p in (passes or []):
+        used.update(p["det_indices"])
+
+    if 0 <= idx < detection_state["n"] and idx not in used:
+        if idx in selected:
+            selected.remove(idx)
+        else:
+            selected.append(idx)
+
+    return (
+        selected,
+        _render_region_overlay(detection_state, selected, passes),
+        _render_selection_status(selected, detection_state),
+    )
+
+
+def _add_pass(passes: list, selected: list | None, detection_state: dict | None):
+    """
+    Group the currently selected detections into a new inpaint pass.
+
+    Returns: [passes_state, selection_state, region_overlay_html,
+              passes_display_html, selection_status_html]
+    """
+    selected = list(selected or [])
+
+    def _result(passes_out, selection_out, status):
         return (
-            passes, gr.update(), _render_passes_html(passes),
-            "<p style='color:orange'>\u26a0 Select at least one detection.</p>",
+            passes_out,
+            selection_out,
+            _render_region_overlay(detection_state, selection_out, passes_out),
+            _render_passes_html(passes_out),
+            status,
+        )
+
+    if detection_state is None:
+        return _result(passes, selected, "")
+
+    if not selected:
+        return _result(
+            passes, selected,
+            "<p style='color:orange'>\u26a0 Click at least one detection first.</p>",
         )
 
     if len(passes) >= MAX_PASSES:
-        return (
-            passes, gr.update(), _render_passes_html(passes),
+        return _result(
+            passes, selected,
             f"<p style='color:orange'>\u26a0 Maximum {MAX_PASSES} passes reached.</p>",
         )
 
     n = detection_state["n"]
     labels = detection_state["labels"]
-    confidences = detection_state["confidences"]
 
-    # Map selected labels back to detection indices
-    choice_to_idx = {}
-    for i in range(n):
-        lbl = _det_choice_label(i, labels[i], confidences[i])
-        choice_to_idx[lbl] = i
-
-    det_indices = []
-    for sel in selected_labels:
-        if sel in choice_to_idx:
-            det_indices.append(choice_to_idx[sel])
+    # Drop any already-assigned / out-of-range indices defensively
+    used = set()
+    for p in passes:
+        used.update(p["det_indices"])
+    det_indices = [i for i in selected if 0 <= i < n and i not in used]
     if not det_indices:
-        return (
-            passes, gr.update(), _render_passes_html(passes),
+        return _result(
+            passes, [],
             "<p style='color:orange'>\u26a0 No valid detections selected.</p>",
         )
 
     pass_num = len(passes) + 1
-    parts = []
-    for idx in sorted(det_indices):
-        parts.append(f"[{idx + 1}] {labels[idx]}")
+    parts = [f"[{idx + 1}] {labels[idx]}" for idx in sorted(det_indices)]
     pass_label = f"Pass {pass_num}: {', '.join(parts)}"
 
-    # Merge masks
+    # Merge masks (union) and bboxes
     masks_pil = [Image.fromarray(detection_state["masks"][idx]) for idx in det_indices]
     if len(masks_pil) > 1:
         merged_masks = mask_merge(masks_pil)
@@ -429,31 +587,34 @@ def _add_pass(
     }
 
     passes = list(passes) + [new_pass]
-
-    # Remove used choices from checkbox
-    remaining = [c for c in all_choices if c not in selected_labels]
-    cb_update = gr.update(choices=remaining, value=[])
-
-    return passes, cb_update, _render_passes_html(passes), ""
+    return _result(passes, [], "")
 
 
 def _auto_one_per_detection(detection_state: dict | None, existing_passes: list):
     """
-    Shortcut: create one pass per detection automatically.
+    Shortcut: create one pass per unassigned detection.
 
-    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    Returns: [passes_state, selection_state, region_overlay_html,
+              passes_display_html, selection_status_html]
     """
+    def _result(passes_out):
+        return (
+            passes_out,
+            [],
+            _render_region_overlay(detection_state, [], passes_out),
+            _render_passes_html(passes_out),
+            "",
+        )
+
     if detection_state is None:
-        return existing_passes, gr.update(), _render_passes_html(existing_passes), ""
+        return _result(list(existing_passes))
 
     n = detection_state["n"]
     if n == 0:
-        return existing_passes, gr.update(), _render_passes_html(existing_passes), ""
+        return _result(list(existing_passes))
 
     labels = detection_state["labels"]
-    confidences = detection_state["confidences"]
 
-    # Find which indices are already assigned
     used = set()
     for p in existing_passes:
         used.update(p["det_indices"])
@@ -467,35 +628,24 @@ def _auto_one_per_detection(detection_state: dict | None, existing_passes: list)
 
         pass_num = len(passes) + 1
         pass_label = f"Pass {pass_num}: [{i + 1}] {labels[i]}"
-        new_pass = {
+        passes.append({
             "label": pass_label,
             "det_indices": [i],
             "merged_mask": detection_state["masks"][i],
             "merged_bbox": detection_state["bboxes"][i],
-        }
-        passes.append(new_pass)
+        })
 
-    # All choices consumed
-    cb_update = gr.update(choices=[], value=[])
-    return passes, cb_update, _render_passes_html(passes), ""
+    return _result(passes)
 
 
 def _clear_passes(detection_state: dict | None):
     """
-    Clear all passes and restore all detection choices.
+    Clear all passes and the current selection.
 
-    Returns: [passes_state, checkbox_update, passes_html, status_html]
+    Returns: [passes_state, selection_state, region_overlay_html,
+              passes_display_html, selection_status_html]
     """
-    if detection_state is None:
-        return [], gr.update(choices=[], value=[]), "", ""
-
-    n = detection_state["n"]
-    labels = detection_state["labels"]
-    confidences = detection_state["confidences"]
-
-    all_choices = [_det_choice_label(i, labels[i], confidences[i]) for i in range(n)]
-    cb_update = gr.update(choices=all_choices, value=[])
-    return [], cb_update, "", ""
+    return [], [], _render_region_overlay(detection_state, [], []), "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +992,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
     with gr.Blocks(analytics_enabled=False) as tab:
         detection_state = gr.State(value=None)
         passes_state = gr.State(value=[])
+        selection_state = gr.State(value=[])  # in-progress selection (the pass being built)
 
         # Hidden Image bridge for paste-params
         _hidden_input = gr.Image(
@@ -884,26 +1035,11 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                         with gr.Group(visible=False, elem_id="ad_adv_selection_panel") as selection_panel:
                             gr.Markdown("### Build inpaint passes")
                             gr.Markdown(
-                                "Check detections below, then click **Add Pass** to "
-                                "group them into an inpaint pass. Repeat to create "
+                                "**Click detections on the image** to add them to "
+                                "the current pass (hover to preview a region), then "
+                                "click **Add Pass** to group them. Repeat to create "
                                 "multiple passes. Each pass gets its own accordion "
                                 "with prompt and settings."
-                            )
-                            det_thumbnails = gr.Gallery(
-                                label="Detected Objects",
-                                elem_id="ad_adv_det_thumbs",
-                                columns=4,
-                                rows=2,
-                                height=200,
-                                interactive=False,
-                                object_fit="contain",
-                                type="pil",
-                            )
-                            det_checkbox_group = gr.CheckboxGroup(
-                                label="Detections",
-                                choices=[],
-                                value=[],
-                                elem_id="ad_adv_det_checkboxes",
                             )
                             with gr.Row():
                                 add_pass_btn = gr.Button(
@@ -951,16 +1087,18 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                     type="pil",
                                 )
                             with gr.Group():
-                                preview_image = gr.Gallery(
-                                    label="Detection Preview",
-                                    show_label=True,
-                                    elem_id="ad_adv_preview",
-                                    columns=1,
-                                    preview=True,
-                                    height=gallery_height,
-                                    interactive=False,
-                                    object_fit="contain",
-                                    type="pil",
+                                # Interactive overlay: base image + clickable
+                                # region divs (see _render_region_overlay).
+                                region_overlay = gr.HTML(
+                                    value="",
+                                    elem_id="ad_adv_region_overlay",
+                                )
+                                # Hidden bridge written by the adAdvPickRegion JS
+                                # hook on each region click ("<idx>|<nonce>").
+                                region_click = gr.Textbox(
+                                    value="",
+                                    visible=False,
+                                    elem_id="ad_adv_region_click",
                                 )
 
             # Expose input_image at module level for cross-tab wiring
@@ -1175,10 +1313,10 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             return _run_detection(img, models_sel, conf, model_mapping=model_mapping)
 
         detect_outputs = (
-            [preview_image, detection_state]
+            [region_overlay, detection_state]
             + [selection_panel]
-            + [det_thumbnails]
-            + [det_checkbox_group]    # choices + value update
+            + [selection_state]       # reset in-progress selection
+            + [selection_status]      # reset status line
             + [passes_state]
             + [passes_display]
             + det_accordions
@@ -1205,51 +1343,44 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             outputs=detect_btn,
         )
 
+        # -- Selection (click a region on the overlay) ------------------
+
+        # The adAdvPickRegion JS hook writes "<idx>|<nonce>" into region_click
+        # and fires its input event; the nonce defeats Gradio's "value
+        # unchanged => no .change" suppression so repeated clicks register.
+        region_click.change(
+            fn=_on_region_click,
+            inputs=[region_click, selection_state, detection_state, passes_state],
+            outputs=[selection_state, region_overlay, selection_status],
+            show_progress=False,
+        )
+
         # -- Pass building ----------------------------------------------
 
-        # _add_pass needs: passes_state, selected checkboxes, detection_state,
-        # and the current checkbox choices (to compute remaining).
-        # In Gradio 3.x CheckboxGroup passed as value gives the selected list;
-        # to also get the choices we pass it twice (value + component ref).
-        # However the component ref only gives value, not choices. So we need
-        # a workaround: _add_pass rebuilds the full choice list from
-        # detection_state and subtracts all already-assigned indices.
-
-        def _add_pass_wrapper(passes, selected, det_state):
-            if det_state is None:
-                return passes, gr.update(), _render_passes_html(passes), ""
-
-            # Rebuild available choices from detection_state minus already-used
-            used = set()
-            for p in passes:
-                used.update(p["det_indices"])
-
-            n = det_state["n"]
-            labels = det_state["labels"]
-            confidences = det_state["confidences"]
-            available = []
-            for i in range(n):
-                if i not in used:
-                    available.append(_det_choice_label(i, labels[i], confidences[i]))
-
-            return _add_pass(passes, selected, det_state, available)
+        pass_outputs = [
+            passes_state,
+            selection_state,
+            region_overlay,
+            passes_display,
+            selection_status,
+        ]
 
         add_pass_btn.click(
-            fn=_add_pass_wrapper,
-            inputs=[passes_state, det_checkbox_group, detection_state],
-            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+            fn=_add_pass,
+            inputs=[passes_state, selection_state, detection_state],
+            outputs=pass_outputs,
         )
 
         auto_pass_btn.click(
             fn=_auto_one_per_detection,
             inputs=[detection_state, passes_state],
-            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+            outputs=pass_outputs,
         )
 
         clear_passes_btn.click(
             fn=_clear_passes,
             inputs=[detection_state],
-            outputs=[passes_state, det_checkbox_group, passes_display, selection_status],
+            outputs=pass_outputs,
         )
 
         # -- Confirm passes -> populate accordions -----------------------
