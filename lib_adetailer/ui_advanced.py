@@ -375,78 +375,100 @@ def _run_detection(
     if image is None:
         return empty
 
-    image = ensure_pil_image(image, "RGB")
-    bare_overlay = (
-        f'{_REGION_STYLE}<div class="ad-adv-stage">'
-        f'<img src="{_img_to_data_uri(image)}" draggable="false"/></div>'
-    )
+    # Everything below can touch external model code / image IO that may raise.
+    # On any uncaught failure, fall back to the ``empty`` payload (with a bare
+    # overlay if we got far enough) so the detect button's trailing ``.then()``
+    # always fires and re-enables it — otherwise it stays stuck on "Detecting…".
+    bare_overlay = ""
+    try:
+        image = ensure_pil_image(image, "RGB")
+        bare_overlay = (
+            f'{_REGION_STYLE}<div class="ad-adv-stage">'
+            f'<img src="{_img_to_data_uri(image)}" draggable="false"/></div>'
+        )
 
-    if not models_selected:
-        empty[0] = bare_overlay
+        if not models_selected:
+            empty[0] = bare_overlay
+            return empty
+
+        device = _get_ultralytics_device()
+
+        all_bboxes: list[list] = []
+        all_masks: list[Image.Image] = []
+        all_confidences: list[float] = []
+        all_labels: list[str] = []
+
+        for model_name in models_selected:
+            if model_name not in model_mapping:
+                print(f"[-] ADetailer+: model {model_name!r} not in mapping - skipped")
+                continue
+
+            model_path = model_mapping[model_name]
+            try:
+                # Neo routes mediapipe by "name does not end in .pt"; both
+                # mediapipe_predict and ultralytics_predict take the model path.
+                if not str(model_name).lower().endswith(".pt"):
+                    pred = mediapipe_predict(model_path, image, confidence)
+                else:
+                    pred = ultralytics_predict(
+                        model_path,
+                        image=image,
+                        confidence=confidence,
+                        device=device,
+                    )
+            except Exception as e:
+                print(f"[-] ADetailer+: Error running {model_name}: {e}")
+                continue
+
+            if pred.bboxes:
+                all_bboxes.extend(pred.bboxes)
+                all_masks.extend(pred.masks)
+                all_confidences.extend(pred.confidences)
+                all_labels.extend([model_name] * len(pred.bboxes))
+
+        if not all_bboxes:
+            empty[0] = bare_overlay
+            return empty
+
+        total_found = len(all_bboxes)
+        n = min(total_found, MAX_DETECTIONS)
+        all_bboxes = all_bboxes[:n]
+        all_masks = all_masks[:n]
+        all_confidences = all_confidences[:n]
+        all_labels = all_labels[:n]
+
+        # Surface the cap instead of silently dropping detections > MAX_DETECTIONS.
+        trunc_note = ""
+        if total_found > n:
+            print(f"[ADetailer+] {total_found} detections found; showing first {n} (max {MAX_DETECTIONS}).")
+            trunc_note = (
+                f"<p style='color:orange'>⚠ {total_found} detections found; "
+                f"showing first {n} (max {MAX_DETECTIONS}).</p>"
+            )
+
+        # State stored as numpy for safe gr.State serialisation.  ``data_uri`` and
+        # ``width``/``height`` are cached so per-click overlay re-renders never need
+        # to re-encode the source image.
+        state = {
+            "source": np.array(image),
+            "width": image.width,
+            "height": image.height,
+            "data_uri": _img_to_data_uri(image),
+            "n": n,
+            "bboxes": [list(b) for b in all_bboxes],
+            "masks": [np.array(m) for m in all_masks],
+            "confidences": all_confidences,
+            "labels": all_labels,
+        }
+
+        overlay_html = _render_region_overlay(state, [], [])
+    except Exception as e:
+        print(f"[-] ADetailer+: detection failed: {e}")
+        if bare_overlay:
+            empty[0] = bare_overlay
+        # surface the error in the (still hidden) selection_status slot is moot;
+        # leave the gallery visible so the user can retry.
         return empty
-
-    device = _get_ultralytics_device()
-
-    all_bboxes: list[list] = []
-    all_masks: list[Image.Image] = []
-    all_confidences: list[float] = []
-    all_labels: list[str] = []
-
-    for model_name in models_selected:
-        if model_name not in model_mapping:
-            print(f"[-] ADetailer+: model {model_name!r} not in mapping - skipped")
-            continue
-
-        model_path = model_mapping[model_name]
-        try:
-            # Neo routes mediapipe by "name does not end in .pt"; both
-            # mediapipe_predict and ultralytics_predict take the model path.
-            if not str(model_name).lower().endswith(".pt"):
-                pred = mediapipe_predict(model_path, image, confidence)
-            else:
-                pred = ultralytics_predict(
-                    model_path,
-                    image=image,
-                    confidence=confidence,
-                    device=device,
-                )
-        except Exception as e:
-            print(f"[-] ADetailer+: Error running {model_name}: {e}")
-            continue
-
-        if pred.bboxes:
-            all_bboxes.extend(pred.bboxes)
-            all_masks.extend(pred.masks)
-            all_confidences.extend(pred.confidences)
-            all_labels.extend([model_name] * len(pred.bboxes))
-
-    if not all_bboxes:
-        empty[0] = bare_overlay
-        return empty
-
-    total_found = len(all_bboxes)
-    n = min(total_found, MAX_DETECTIONS)
-    all_bboxes = all_bboxes[:n]
-    all_masks = all_masks[:n]
-    all_confidences = all_confidences[:n]
-    all_labels = all_labels[:n]
-
-    # State stored as numpy for safe gr.State serialisation.  ``data_uri`` and
-    # ``width``/``height`` are cached so per-click overlay re-renders never need
-    # to re-encode the source image.
-    state = {
-        "source": np.array(image),
-        "width": image.width,
-        "height": image.height,
-        "data_uri": _img_to_data_uri(image),
-        "n": n,
-        "bboxes": [list(b) for b in all_bboxes],
-        "masks": [np.array(m) for m in all_masks],
-        "confidences": all_confidences,
-        "labels": all_labels,
-    }
-
-    overlay_html = _render_region_overlay(state, [], [])
 
     N = MAX_PASSES
     return (
@@ -454,7 +476,7 @@ def _run_detection(
         + [gr.update(visible=True)]                       # selection panel visible
         + [gr.update(visible=False)]                      # hide input gallery
         + [[]]                                            # selection_state reset
-        + [""]                                            # selection_status reset
+        + [trunc_note]                                    # selection_status (cap note)
         + [[]]                                            # passes_state reset
         + [""]                                            # passes_html reset
         + [gr.update(visible=False)] * N                  # hide all accordions
@@ -786,6 +808,7 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
 
     working = source.copy()
     done = 0
+    failures: list[str] = []
     # Save into img2img samples folder (respecting outdir_samples override)
     outpath = (
         getattr(opts, "outdir_samples", "")
@@ -892,6 +915,7 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
                 done += 1
         except Exception as e:
             print(f"[-] ADetailer+: Error on pass {i + 1}: {e}")
+            failures.append(f"pass {i + 1}: {e}")
             continue
         finally:
             try:
@@ -902,6 +926,8 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
     status = f"\u2713  Processed {done} of {n_passes} pass(es)."
     if shared.state.interrupted:
         status += " (interrupted)"
+    if failures:
+        status += " \u26a0 Failed: " + "; ".join(failures)
 
     # Save final composited image into img2img output folder
     if done > 0 and working is not None:
@@ -1180,11 +1206,18 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                     value=InpaintBBoxMatchMode.STRICT.value,
                                     elem_id="ad_adv_bbox_match",
                                 )
+                                # Only pre-select defaults that actually exist
+                                # on this install (avoids Gradio dropping/erroring
+                                # on unknown style names).
+                                _default_styles = [
+                                    s for s in ("Illustrious", "style")
+                                    if s in style_names
+                                ]
                                 common_styles = gr.Dropdown(
                                     label="Styles",
                                     choices=style_names,
                                     multiselect=True,
-                                    value=["Illustrious", "style"],
+                                    value=_default_styles,
                                     elem_id="ad_adv_styles",
                                 )
 
@@ -1439,9 +1472,9 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         # -- Processing -------------------------------------------------
 
         def _process_and_wrap(det_state, passes, *args):
-            result_img, _status = _process_all(det_state, passes, *args)
+            result_img, status = _process_all(det_state, passes, *args)
             gallery_val = [result_img] if result_img is not None else []
-            return gallery_val
+            return gallery_val, f"<p>{status}</p>" if status else ""
 
         process_inputs = (
             [detection_state, passes_state]
@@ -1471,7 +1504,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         ).then(
             fn=_process_and_wrap,
             inputs=process_inputs,
-            outputs=[output_gallery],
+            outputs=[output_gallery, html_log],
         ).then(
             fn=lambda: gr.update(value="Process All Passes", interactive=True),
             inputs=None,
@@ -1500,16 +1533,35 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         # -- Reuse button -----------------------------------------------
 
         def _reuse_output(gallery_images):
+            # Send the output back to the input as a fresh, undetected image:
+            # re-show the (possibly hidden) upload gallery, clear the stale
+            # overlay, hide the selection panel, and reset detection state so the
+            # user lands on a clean Detection tab ready to re-run on the new image.
+            no_op = (gr.update(),) * 6
             if not gallery_images:
-                return gr.update()
+                return no_op
             first = gallery_images[0]
             img = first[0] if isinstance(first, (list, tuple)) else first
-            return [img]
+            return (
+                [img],                      # input_image
+                gr.update(visible=True),    # input_image_group re-shown
+                "",                         # region_overlay cleared
+                gr.update(visible=False),   # selection_panel hidden
+                None,                       # detection_state reset
+                [],                         # selection_state reset
+            )
 
         reuse_btn.click(
             fn=_reuse_output,
             inputs=[output_gallery],
-            outputs=[input_image],
+            outputs=[
+                input_image,
+                input_image_group,
+                region_overlay,
+                selection_panel,
+                detection_state,
+                selection_state,
+            ],
         ).then(
             fn=lambda: gr.update(selected="detection_tab"),
             inputs=None,
