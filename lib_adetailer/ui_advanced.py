@@ -108,7 +108,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from rich import print  # noqa: A004
 
-from lib_adetailer import __version__, mediapipe_predict, ultralytics_predict
+from lib_adetailer import __version__, mediapipe_predict, ultralytics_predict, style_picker_hook
 from lib_adetailer.args import INPAINT_BBOX_MATCH_MODES, InpaintBBoxMatchMode
 from lib_adetailer.detection.common import PredictOutput, color_for_label
 from lib_adetailer.mask import dilate_erode, mask_merge
@@ -845,6 +845,7 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
         dilate_erodes xMAX_PASSES  [5N  .. 6N)
         --- common ---
         steps, cfg, width, height, sampler, scheduler, padding, bbox_match, styles
+        --- Style Picker slots (empty when that extension is not installed) ---
     """
     from modules import paths, scripts as ms, shared, images
     from modules.processing import StableDiffusionProcessingImg2Img, process_images
@@ -871,6 +872,7 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
     padding = int(args[c + 6])
     bbox_match = str(args[c + 7]) if len(args) > c + 7 else InpaintBBoxMatchMode.OFF.value
     styles = list(args[c + 8]) if len(args) > c + 8 and args[c + 8] else []
+    style_picker_slots = args[c + 9 :]
 
     if shared.sd_model is None:
         return None, "\u26a0  No Stable Diffusion model loaded."
@@ -902,6 +904,7 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
         p = passes_state[i]
         prompt = str(prompts[i]).strip()
         neg_prompt = str(neg_prompts[i]).strip()
+        prompt, neg_prompt, style_picker_info = style_picker_hook.apply(prompt, neg_prompt, style_picker_slots)
         denoise = float(denoises[i])
         m_blur = int(mask_blurs[i])
         m_dilate = int(dilate_erodes[i])
@@ -957,6 +960,8 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
             i2i.cached_uc = [None, None]
             i2i._ad_disabled = True
             i2i._ad_inner = True
+            if style_picker_info:
+                i2i.extra_generation_params["Style Picker"] = style_picker_info
 
             # Guard against Vectorscope CC extension
             try:
@@ -1212,9 +1217,11 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             global ad_plus_input_gallery
             ad_plus_input_gallery = input_image
 
-            # Register paste-params destination
+            # Register paste-params destination (Style Picker fields are added
+            # once the picker exists, in the Inpainting tab)
+            adp_paste_fields: list = []
             parameters_copypaste.add_paste_fields(
-                "adetailer_plus", _hidden_input, [], None
+                "adetailer_plus", _hidden_input, adp_paste_fields, None
             )
             _hidden_input.change(
                 # Forward the pasted PIL into the Gallery AND re-show the gallery
@@ -1282,7 +1289,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                 # on this install (avoids Gradio dropping/erroring
                                 # on unknown style names).
                                 _default_styles = [
-                                    s for s in ("Illustrious", "style")
+                                    s for s in ("Illustrious",)
                                     if s in style_names
                                 ]
                                 common_styles = gr.Dropdown(
@@ -1292,6 +1299,11 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                                     value=_default_styles,
                                     elem_id="ad_adv_styles",
                                 )
+                            style_picker_slots = style_picker_hook.create_ui()
+                            adp_paste_fields.extend(
+                                parameters_copypaste.PasteField(*f)
+                                for f in style_picker_hook.paste_fields()
+                            )
 
                         # Per-pass accordions (one per pass, up to MAX_PASSES)
                         det_accordions: list[gr.Accordion] = []
@@ -1567,6 +1579,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                 common_bbox_match,
                 common_styles,
             ]
+            + style_picker_slots
         )
 
         process_btn.click(
@@ -1641,6 +1654,9 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         )
 
         # -- Send-to buttons --------------------------------------------
+
+        style_picker_hook.link_send_button("adetailer_plus", "img2img", send_img2img_btn)
+        style_picker_hook.link_send_button("adetailer_plus", "img2img", send_inpaint_btn)
 
         for paste_tabname, paste_button in [
             ("img2img", send_img2img_btn),

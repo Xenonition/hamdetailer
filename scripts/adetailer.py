@@ -38,6 +38,7 @@ from lib_adetailer.mask import (
     sort_bboxes,
 )
 from lib_adetailer.opts import OptimalCropSize, dynamic_denoise_strength
+from lib_adetailer import style_picker_hook
 from lib_adetailer.ui import WebuiInfo, adui, ordinal, suffix
 from lib_adetailer.utils import ensure_pil_image, print
 from lib_adetailer.utils.helper import (
@@ -856,6 +857,7 @@ def on_after_component(component: gr.components.Component, **kwargs):
                     paste_field_names=[],
                 )
             )
+        style_picker_hook.link_send_button("txt2img", "adetailer_plus", _txt2img_send_adp_btn)
         return
 
     if eid == "img2img_send_to_extras":
@@ -876,6 +878,7 @@ def on_after_component(component: gr.components.Component, **kwargs):
                     paste_field_names=[],
                 )
             )
+        style_picker_hook.link_send_button("img2img", "adetailer_plus", _img2img_send_adp_btn)
         return
 
 
