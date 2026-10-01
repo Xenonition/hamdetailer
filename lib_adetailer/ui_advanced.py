@@ -207,6 +207,16 @@ _REGION_STYLE = """<style>
 .ad-region-label.label-inside { top: 2px; left: 2px; }
 .ad-region.selected .ad-region-label { background: #2ecc71; }
 .ad-region.assigned .ad-region-label { background: #888; }
+.ad-seg {
+    position: absolute; inset: 0;
+    background-color: var(--rc, #e63946); opacity: .30;
+    -webkit-mask-size: 100% 100%; mask-size: 100% 100%;
+    -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+    -webkit-mask-position: center center; mask-position: center center;
+    pointer-events: none;
+}
+.ad-seg.selected { background-color: #2ecc71; opacity: .45; }
+.ad-seg.assigned { background-color: #888; opacity: .40; }
 </style>"""
 
 
@@ -233,6 +243,42 @@ def _img_to_data_uri(arr) -> str:
     return f"data:image/png;base64,{b64}"
 
 
+def _mask_to_data_uri(arr) -> str:
+    """Encode a single-channel mask (numpy array or PIL ``L``) as an RGBA PNG
+    ``data:`` URI whose **alpha channel is the mask**. Used as a CSS
+    ``mask-image`` so a colored div is painted only over the segmented area.
+    Encoded once at detection time and cached in ``detection_state`` so per-click
+    overlay re-renders never re-encode it."""
+    if isinstance(arr, Image.Image):
+        a = arr.convert("L")
+    else:
+        m = arr
+        if getattr(m, "ndim", 2) == 3:
+            m = m[..., 0]
+        a = Image.fromarray(m.astype("uint8"), mode="L")
+    white = Image.new("L", a.size, 255)
+    rgba = Image.merge("RGBA", (white, white, white, a))
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _no_detection_notice(message: str = "No detections found.") -> str:
+    """A simple notice shown in place of the region overlay when detection
+    yields nothing — keeps the input gallery as the only image (no redundant
+    bottom canvas)."""
+    return (
+        "<div style='padding:14px 16px;border:1px dashed var(--border-color-primary,#888);"
+        "border-radius:6px;text-align:center;color:var(--body-text-color-subdued,#aaa);"
+        "font-size:14px;'>"
+        f"{_esc(message)}"
+        "<div style='margin-top:4px;font-size:12px;opacity:.8;'>"
+        "Try lowering the confidence threshold or selecting a different model.</div>"
+        "</div>"
+    )
+
+
 def _render_region_overlay(
     detection_state: dict | None,
     selected_indices: list | None,
@@ -254,6 +300,7 @@ def _render_region_overlay(
     bboxes = detection_state["bboxes"]
     labels = detection_state["labels"]
     confidences = detection_state["confidences"]
+    mask_uris = detection_state.get("mask_uris") or []
     selected = set(selected_indices or [])
 
     assigned: dict[int, int] = {}
@@ -263,10 +310,32 @@ def _render_region_overlay(
 
     order = sorted(range(n), key=lambda i: _bbox_area(bboxes[i]), reverse=True)
 
+    def _state_of(i: int) -> str:
+        if i in assigned:
+            return "assigned"
+        if i in selected:
+            return "selected"
+        return ""
+
     parts = [
         _REGION_STYLE,
         f'<div class="ad-adv-stage"><img src="{data_uri}" draggable="false"/>',
     ]
+
+    # Segment fills first (largest first) so they sit *under* the clickable bbox
+    # divs and never intercept clicks (they are pointer-events:none anyway).
+    for i in order:
+        if i >= len(mask_uris) or not mask_uris[i]:
+            continue
+        r, g, b = color_for_label(labels[i])
+        seg_style = (
+            f"--rc:rgb({r},{g},{b});"
+            f"-webkit-mask-image:url({mask_uris[i]});mask-image:url({mask_uris[i]});"
+        )
+        parts.append(
+            f'<div class="ad-seg {_state_of(i)}" data-idx="{i}" style="{seg_style}"></div>'
+        )
+
     for i in order:
         x1, y1, x2, y2 = (float(v) for v in bboxes[i])
         left = max(0.0, x1) / W * 100.0
@@ -274,17 +343,15 @@ def _render_region_overlay(
         w = (x2 - x1) / W * 100.0
         h = (y2 - y1) / H * 100.0
         r, g, b = color_for_label(labels[i])
+        state = _state_of(i)
 
-        if i in assigned:
-            state = "assigned"
+        if state == "assigned":
             text = f"Pass {assigned[i]}: [{i + 1}] {labels[i]}"
             onclick = ""
-        elif i in selected:
-            state = "selected"
+        elif state == "selected":
             text = f"✓ [{i + 1}] {labels[i]} {confidences[i]:.2f}"
             onclick = f' onclick="adAdvPickRegion({i})"'
         else:
-            state = ""
             text = f"[{i + 1}] {labels[i]} {confidences[i]:.2f}"
             onclick = f' onclick="adAdvPickRegion({i})"'
 
@@ -427,7 +494,9 @@ def _run_detection(
                 all_labels.extend([model_name] * len(pred.bboxes))
 
         if not all_bboxes:
-            empty[0] = bare_overlay
+            # Nothing detected: show only the input gallery + a notice, not a
+            # redundant bottom canvas of the same image with no boxes.
+            empty[0] = _no_detection_notice()
             return empty
 
         total_found = len(all_bboxes)
@@ -457,6 +526,9 @@ def _run_detection(
             "n": n,
             "bboxes": [list(b) for b in all_bboxes],
             "masks": [np.array(m) for m in all_masks],
+            # Per-detection segment overlays (alpha PNG) encoded once; used as a
+            # CSS mask-image to highlight the actual segmented area.
+            "mask_uris": [_mask_to_data_uri(m) for m in all_masks],
             "confidences": all_confidences,
             "labels": all_labels,
         }
