@@ -77,6 +77,7 @@ def state_init(w: Widgets) -> dict[str, Any]:
 
 def adui(num_models: int, is_img2img: bool, webui_info: WebuiInfo):
     states = []
+    widgets = []
     infotext_fields = []
     eid = partial(elem_id, n=None, is_img2img=is_img2img)
 
@@ -84,12 +85,19 @@ def adui(num_models: int, is_img2img: bool, webui_info: WebuiInfo):
         value=False, label="ADetailer", elem_id=eid("ad_main_accordion")
     ) as ad_enable:
         with gr.Row():
-            with gr.Column(scale=10):
+            with gr.Column(scale=8):
                 ad_skip_img2img = gr.Checkbox(
                     value=False,
                     label="Skip img2img",
                     visible=is_img2img,
                     elem_id=eid("ad_skip_img2img"),
+                )
+            with gr.Column(scale=2, min_width=120):
+                ad_clear_settings = gr.Button(
+                    value="🗑️ Clear All Settings",
+                    size="sm",
+                    variant="secondary",
+                    elem_id=eid("ad_clear_settings"),
                 )
             with gr.Column(scale=1, min_width=80):
                 gr.Markdown(
@@ -103,17 +111,69 @@ def adui(num_models: int, is_img2img: bool, webui_info: WebuiInfo):
         with gr.Tabs():
             for n in range(num_models):
                 with gr.Tab(label=ordinal(n + 1)):
-                    state, infofields = _ui_group(
+                    state, infofields, w = _ui_group(
                         n=n,
                         is_img2img=is_img2img,
                         webui_info=webui_info,
                     )
 
                 states.append(state)
+                widgets.append(w)
                 infotext_fields.extend(infofields)
+
+        _wire_clear_settings(
+            ad_clear_settings, ad_enable, ad_skip_img2img, states, widgets
+        )
 
     components = [ad_enable, ad_skip_img2img, *states]
     return components, infotext_fields
+
+
+def _wire_clear_settings(
+    clear_button: gr.Button,
+    ad_enable,
+    ad_skip_img2img: gr.Checkbox,
+    states: list[gr.State],
+    widgets: list[Widgets],
+):
+    """Reset every per-tab widget (and its gr.State) back to its build-time
+    default, plus close the accordion and clear the skip-img2img flag."""
+
+    # Snapshot defaults at build time. Each widget's `.value`/`.visible` as it
+    # was constructed *is* the default we want to restore.
+    flat_widgets: list[Any] = []
+    default_values: list[Any] = []
+    default_visible: list[bool] = []
+    for w in widgets:
+        for attr in ALL_ARGS.attrs:
+            widget = getattr(w, attr)
+            flat_widgets.append(widget)
+            default_values.append(widget.value)
+            default_visible.append(getattr(widget, "visible", True))
+
+    state_defaults = [state_init(w) for w in widgets]
+
+    def _reset_all():
+        widget_updates = [
+            gr.update(value=value, visible=visible)
+            for value, visible in zip(default_values, default_visible)
+        ]
+        state_updates = [dict(d) for d in state_defaults]
+        return [
+            gr.update(value=False),  # ad_enable (close accordion)
+            gr.update(value=False),  # ad_skip_img2img
+            *widget_updates,
+            *state_updates,
+        ]
+
+    outputs = [ad_enable, ad_skip_img2img, *flat_widgets, *states]
+    clear_button.click(
+        fn=_reset_all,
+        inputs=[],
+        outputs=outputs,
+        queue=False,
+        show_progress=False,
+    )
 
 
 def _ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
@@ -214,7 +274,7 @@ def _ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
         else:
             infotext_fields.append((getattr(w, attr), name + suffix(n)))
 
-    return state, infotext_fields
+    return state, infotext_fields, w
 
 
 # region SubGroups
