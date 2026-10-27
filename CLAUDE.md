@@ -18,7 +18,8 @@ lib_adetailer/              # Core library — detection, args, masks, opts (was
   opts.py                   # OptimalCropSize (strict / free), dynamic_denoise_strength
   ui.py                     # Original ADetailer accordion UI (inside txt2img/img2img)
   ui_advanced.py            # ADetailer+ standalone tab (THE MAIN FILE FOR NEW FEATURES)
-  auto_mapping.py           # default_auto_mapping_json (ported from fork)
+  auto_mapping.py           # default_auto_mapping_json (keyword clusters; used by decider.keyword_suggest)
+  decider.py                # Suggest from prompt: region catalog, keyword + System One deciders (stdlib only)
   controlnet.py             # ControlNet integration
   detection/
     common.py               # PredictOutput, get_models, draw_detection_overlay, color_for_label
@@ -136,6 +137,32 @@ double-assignment). "Auto: 1 per detection" creates one pass per unassigned dete
 **Hidden Image bridge**: `image_from_url_text` returns a single PIL image, but `gr.Gallery` expects a list. A hidden `gr.Image(visible=False)` receives the PIL, then `.change()` wraps it as `[img]` and forwards to the Gallery.
 
 The JS function `switch_to_adetailer_plus()` (in `javascript/adetailer_plus.js`) is auto-called by `connect_paste_params_buttons` via `_js=f"switch_to_{binding.tabname}"`.
+
+### Suggest from Prompt (`lib_adetailer/decider.py`)
+
+Detection tab: **Source prompt** box + **🧭 Suggest from prompt** button. Suggest pre-selects
+detection models; after **Confirm**, a chained `.then(_fill_pass_prompts)` writes each pass's
+prompt from the tags of the regions its detections came from (it only touches `det_prompts`,
+so the three flat return lists are unchanged).
+
+- `decider.py` is **stdlib only, no module-level imports from `lib_adetailer`** — the decider lab
+  (`C:\Projects\forge-neo-decider-lab`) loads it by path and drives it with in-process Laya.
+  `REGIONS` (region → booru description → model files in preference order) is the catalog both use.
+- Deciders: `keyword_suggest` (the `auto_mapping.py` clusters) or `DecisionModelDecider` over a
+  System One client (`SystemOneHTTP`: `POST /v1/systemone`, the Jev wire format). Chosen by the
+  `ad_plus_decider*` settings (Settings → ADetailer). A failing server falls back to keywords.
+- The server runs **outside Forge**: Laya needs transformers 5.x, Forge pins 4.57. Start it with
+  `uv run python serve.py` in the lab (binds 127.0.0.1:8000, CPU).
+- Source prompt is filled on txt2img/img2img **🔀 send-to**: `on_ui_tabs` passes the (button,
+  gallery) pairs as `send_sources`, wired with `js="extract_image_from_gallery"` and read via
+  `images.read_info_from_image`. The send-to `ParamBinding` itself has no `source_tabname`, so
+  Forge's paste fields never carry the prompt. Senders that paste infotext (Infinite Image
+  Browsing's patched "Send to ADetailer+", which binds with `source_text_component`) fill it
+  through the `PasteField(source_prompt, "Prompt")` in `adp_paste_fields`. Both paths run the
+  infotext-pasted callbacks, so Style Picker strips its appended picks. If the box is empty,
+  Suggest falls back to the gallery image's own infotext.
+- `suggest_state` is `{"prompt", "items"}`; Confirm only pre-fills when the Source prompt still
+  equals that prompt, so a suggestion never leaks onto the next image.
 
 ### Tag Autocomplete Integration
 

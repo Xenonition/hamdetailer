@@ -1003,6 +1003,50 @@ def on_ui_settings():
         ),
     )
 
+    from lib_adetailer.ui_advanced import DECIDER_KEYWORDS, DECIDER_SERVER
+
+    shared.opts.add_option(
+        "ad_plus_decider",
+        shared.OptionInfo(
+            default=DECIDER_KEYWORDS,
+            label="ADetailer+ \"Suggest from prompt\" uses",
+            component=gr.Radio,
+            component_args={"choices": [DECIDER_KEYWORDS, DECIDER_SERVER]},
+            **args,
+        ).info("server falls back to keyword rules when unreachable"),
+    )
+
+    shared.opts.add_option(
+        "ad_plus_decider_url",
+        shared.OptionInfo(
+            default="http://127.0.0.1:8000",
+            label="ADetailer+ decision model server URL (POST /v1/systemone)",
+            component=gr.Textbox,
+            **args,
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_plus_decider_model",
+        shared.OptionInfo(
+            default="typed-decisions",
+            label="ADetailer+ decision model name sent to the server (blank = server default)",
+            component=gr.Textbox,
+            **args,
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_plus_decider_threshold",
+        shared.OptionInfo(
+            default=0.5,
+            label="ADetailer+ decision model threshold (suggest a detector above this probability)",
+            component=gr.Slider,
+            component_args={"minimum": 0.0, "maximum": 1.0, "step": 0.05},
+            **args,
+        ),
+    )
+
 
 # region X/Y/Z Grid
 
@@ -1156,7 +1200,15 @@ def add_api_endpoints(_: gr.Blocks, app: "FastAPI"):
 def on_ui_tabs():
     from lib_adetailer.ui_advanced import create_advanced_tab
 
-    tab = create_advanced_tab(model_mapping)
+    send_sources = [
+        (btn, gallery)
+        for btn, gallery in (
+            (_txt2img_send_adp_btn, _txt2img_gallery),
+            (_img2img_send_adp_btn, _img2img_gallery),
+        )
+        if btn is not None and gallery is not None
+    ]
+    tab = create_advanced_tab(model_mapping, send_sources)
     return [(tab, "ADetailer+", "adetailer_advanced")]
 
 

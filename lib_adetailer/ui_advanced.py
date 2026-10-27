@@ -108,7 +108,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from rich import print  # noqa: A004
 
-from lib_adetailer import __version__, mediapipe_predict, ultralytics_predict, style_picker_hook
+from lib_adetailer import __version__, decider, mediapipe_predict, ultralytics_predict, style_picker_hook
 from lib_adetailer.args import INPAINT_BBOX_MATCH_MODES, InpaintBBoxMatchMode
 from lib_adetailer.detection.common import PredictOutput, color_for_label
 from lib_adetailer.mask import dilate_erode, mask_merge
@@ -828,6 +828,111 @@ def _confirm_passes(detection_state: dict | None, passes: list):
 
 
 # ---------------------------------------------------------------------------
+#  Suggest from prompt (lib_adetailer/decider.py)
+# ---------------------------------------------------------------------------
+
+DECIDER_KEYWORDS = "Keyword rules"
+DECIDER_SERVER = "Decision model server"
+
+
+def _prompt_from_image(img) -> str:
+    """Positive prompt from a generated image's infotext, or "".
+
+    Goes through the infotext-pasted callbacks like Forge's own paste, so extensions that
+    append to the prompt (Style Picker) strip their text back out.
+    """
+    from modules import images, script_callbacks
+    from modules.infotext_utils import image_from_url_text, parse_generation_parameters
+
+    if img is not None and not isinstance(img, Image.Image):
+        img = image_from_url_text(img)
+    if img is None:
+        return ""
+    info, _ = images.read_info_from_image(img)
+    if not info:
+        return ""
+    params = parse_generation_parameters(info)
+    script_callbacks.infotext_pasted_callback(info, params)
+    return params.get("Prompt", "")
+
+
+def _first_gallery_image(gallery_images):
+    if not gallery_images:
+        return None
+    first = gallery_images[0]
+    return first[0] if isinstance(first, (list, tuple)) else first
+
+
+def _suggest(prompt: str, gallery_images, *, model_list: list[str]):
+    """Returns [model_dropdown, suggest_state, suggest_status, source_prompt]."""
+    from modules.shared import opts
+
+    prompt = (prompt or "").strip()
+    from_image = False
+    if not prompt:
+        try:
+            prompt = _prompt_from_image(_first_gallery_image(gallery_images))
+            from_image = bool(prompt)
+        except Exception as e:
+            print(f"[-] ADetailer+: could not read prompt from image: {e}")
+    if not prompt:
+        return (gr.update(), None,
+                "<p style='color:orange'>No prompt: send an image from txt2img/img2img, "
+                "or paste its prompt above.</p>", gr.update())
+
+    note = ""
+    result = None
+    if getattr(opts, "ad_plus_decider", DECIDER_KEYWORDS) == DECIDER_SERVER:
+        client = decider.SystemOneHTTP(
+            getattr(opts, "ad_plus_decider_url", "http://127.0.0.1:8000"),
+            model=getattr(opts, "ad_plus_decider_model", "") or None,
+        )
+        try:
+            result = decider.DecisionModelDecider(
+                client, threshold=float(getattr(opts, "ad_plus_decider_threshold", 0.5)),
+            ).suggest(prompt, model_list)
+        except Exception as e:
+            print(f"[-] ADetailer+: decision model server failed ({e}); using keyword rules")
+            note = f"Server unreachable or failed ({_esc(e)}); used keyword rules instead. "
+    if result is None:
+        result = decider.keyword_suggest(prompt, model_list)
+
+    models = list(dict.fromkeys(s.model for s in result.items))
+    rows = "".join(
+        f"<li><b>{_esc(s.region)}</b> → <code>{_esc(s.model)}</code>"
+        + (f" ({s.score:.2f})" if s.score < 1 else "")
+        + f": {_esc(', '.join(s.tags)) or '<i>no tags</i>'}</li>"
+        for s in result.items
+    )
+    extra = "".join(f"<br><small>{_esc(n)}</small>" for n in result.notes)
+    status = (
+        f"<p><small>{note}Suggested by {_esc(result.decider)}"
+        + (" from the image's prompt" if from_image else "")
+        + f":</small></p><ul>{rows}</ul>{extra}"
+        if result.items else
+        f"<p><small>{note}{_esc(result.decider)}: nothing to suggest for this prompt.</small></p>{extra}"
+    )
+    state = {"prompt": prompt, "items": [vars(s) for s in result.items]} if result.items else None
+    return (gr.update(value=models) if models else gr.update(), state, status,
+            gr.update(value=prompt) if from_image else gr.update())
+
+
+def _fill_pass_prompts(detection_state: dict | None, passes: list | None, suggestion: dict | None,
+                       source_prompt: str):
+    """Pre-fill each pass's prompt with its regions' suggested tags (runs after Confirm).
+
+    Skipped when the Source prompt changed since Suggest (a new image was sent in, or the
+    prompt was edited): that suggestion belongs to another prompt.
+    """
+    N = MAX_PASSES
+    if (not detection_state or not passes or not suggestion
+            or suggestion["prompt"] != (source_prompt or "").strip()):
+        return [gr.update()] * N
+    filled = decider.prompts_for_passes(passes[:N], detection_state["labels"], suggestion["items"])
+    return [gr.update(value=p) if p else gr.update() for p in filled] + [gr.update()] * (N - len(filled))
+
+
+# ---------------------------------------------------------------------------
 #  Processing callback
 # ---------------------------------------------------------------------------
 
@@ -1038,8 +1143,12 @@ def _process_all(detection_state: dict | None, passes_state: list | None, *args)
 #  Tab builder
 # ---------------------------------------------------------------------------
 
-def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
-    """Build the full ADetailer Advanced tab and return the Blocks container."""
+def create_advanced_tab(model_mapping: dict[str, str], send_sources: list | tuple = ()) -> gr.Blocks:
+    """Build the full ADetailer Advanced tab and return the Blocks container.
+
+    ``send_sources``: (send-to button, source gallery) pairs from txt2img/img2img; clicking one
+    also copies the sent image's prompt into the Source prompt box.
+    """
     from modules.sd_samplers import all_samplers
     from modules import sd_schedulers
     from modules.shared import opts
@@ -1105,6 +1214,7 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
         detection_state = gr.State(value=None)
         passes_state = gr.State(value=[])
         selection_state = gr.State(value=[])  # in-progress selection (the pass being built)
+        suggest_state = gr.State(value=None)  # last "Suggest from prompt" result (Suggestion dicts)
 
         # Hidden Image bridge for paste-params
         _hidden_input = gr.Image(
@@ -1121,6 +1231,18 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
                 with gr.Row(equal_height=True):
                     # -- left: controls + selection panel --------
                     with gr.Column(scale=1):
+                        source_prompt = gr.Textbox(
+                            label="Source prompt",
+                            lines=2,
+                            placeholder="Filled on send-to; or paste the image's prompt",
+                            elem_id="ad_adv_source_prompt",
+                        )
+                        suggest_btn = gr.Button(
+                            "\U0001f9ed Suggest from prompt",
+                            variant="secondary",
+                            elem_id="ad_adv_suggest_btn",
+                        )
+                        suggest_status = gr.HTML(value="", elem_id="ad_adv_suggest_status")
                         model_dropdown = gr.Dropdown(
                             label="Detection Models",
                             choices=model_list,
@@ -1219,7 +1341,13 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
 
             # Register paste-params destination (Style Picker fields are added
             # once the picker exists, in the Inpainting tab)
-            adp_paste_fields: list = []
+            # Prompt -> Source prompt for senders that paste infotext (Infinite Image
+            # Browsing's "Send to ADetailer+", PNG Info); the 🔀 buttons only carry the
+            # image and are handled by ``send_sources`` below.
+            adp_paste_fields: list = [
+                parameters_copypaste.PasteField(source_prompt, "Prompt"),
+                parameters_copypaste.PasteField(suggest_status, lambda params: ""),
+            ]
             parameters_copypaste.add_paste_fields(
                 "adetailer_plus", _hidden_input, adp_paste_fields, None
             )
@@ -1475,6 +1603,32 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             outputs=detect_btn,
         )
 
+        # -- Suggest from prompt -----------------------------------------
+
+        suggest_btn.click(
+            fn=lambda: gr.update(value="⏳ Suggesting…", interactive=False),
+            inputs=None,
+            outputs=suggest_btn,
+        ).then(
+            fn=lambda prompt, gallery: _suggest(prompt, gallery, model_list=model_list),
+            inputs=[source_prompt, input_image],
+            outputs=[model_dropdown, suggest_state, suggest_status, source_prompt],
+        ).then(
+            fn=lambda: gr.update(value="\U0001f9ed Suggest from prompt", interactive=True),
+            inputs=None,
+            outputs=suggest_btn,
+        )
+
+        # A new send-to brings a new prompt: copy it in, drop the old suggestion.
+        for send_btn, src_gallery in send_sources:
+            send_btn.click(
+                fn=lambda x: (_prompt_from_image(x), None, ""),
+                inputs=[src_gallery],
+                outputs=[source_prompt, suggest_state, suggest_status],
+                js="extract_image_from_gallery",
+                show_progress=False,
+            )
+
         # -- Selection (click a region on the overlay) ------------------
 
         # The adAdvPickRegion JS hook writes "<idx>|<nonce>" into region_click
@@ -1547,6 +1701,10 @@ def create_advanced_tab(model_mapping: dict[str, str]) -> gr.Blocks:
             fn=_confirm_and_check,
             inputs=[detection_state, passes_state],
             outputs=confirm_outputs,
+        ).then(
+            fn=_fill_pass_prompts,
+            inputs=[detection_state, passes_state, suggest_state, source_prompt],
+            outputs=det_prompts,
         ).then(
             fn=lambda passes: gr.update(selected="inpainting_tab") if passes else gr.update(),
             inputs=[passes_state],
