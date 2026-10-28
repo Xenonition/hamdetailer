@@ -1027,6 +1027,16 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        "ad_plus_decider_command",
+        shared.OptionInfo(
+            default="",
+            label="ADetailer+ command that starts the decision model server when it isn't running",
+            component=gr.Textbox,
+            **args,
+        ).info("run on the first Suggest that finds the server down, stopped when Forge exits; blank = start it yourself"),
+    )
+
+    shared.opts.add_option(
         "ad_plus_decider_model",
         shared.OptionInfo(
             default="typed-decisions",

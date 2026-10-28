@@ -883,11 +883,12 @@ def _suggest(prompt: str, gallery_images, *, model_list: list[str]):
     note = ""
     result = None
     if getattr(opts, "ad_plus_decider", DECIDER_KEYWORDS) == DECIDER_SERVER:
-        client = decider.SystemOneHTTP(
-            getattr(opts, "ad_plus_decider_url", "http://127.0.0.1:8000"),
-            model=getattr(opts, "ad_plus_decider_model", "") or None,
-        )
+        url = getattr(opts, "ad_plus_decider_url", "http://127.0.0.1:8000")
+        command = getattr(opts, "ad_plus_decider_command", "").strip()
+        client = decider.SystemOneHTTP(url, model=getattr(opts, "ad_plus_decider_model", "") or None)
         try:
+            if command and decider.launcher.ensure(url, command):
+                note = "Started the decision model server (stops when Forge exits). "
             result = decider.DecisionModelDecider(
                 client, threshold=float(getattr(opts, "ad_plus_decider_threshold", 0.5)),
             ).suggest(prompt, model_list)

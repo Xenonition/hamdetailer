@@ -151,8 +151,11 @@ so the three flat return lists are unchanged).
 - Deciders: `keyword_suggest` (the `auto_mapping.py` clusters) or `DecisionModelDecider` over a
   System One client (`SystemOneHTTP`: `POST /v1/systemone`, the Jev wire format). Chosen by the
   `ad_plus_decider*` settings (Settings → ADetailer). A failing server falls back to keywords.
-- The server runs **outside Forge**: Laya needs transformers 5.x, Forge pins 4.57. Start it with
-  `uv run python serve.py` in the lab (binds 127.0.0.1:8000, CPU).
+- The server runs **outside Forge**: Laya needs transformers 5.x, Forge pins 4.57. With
+  `ad_plus_decider_command` set (e.g. `uv run --directory C:\Projects\forge-neo-decider-lab python
+  serve.py`), `decider.launcher` runs it on the first Suggest whose `GET /health` fails, waits for
+  it, and kills its process tree at Forge exit (`atexit`); a server it didn't start is never
+  stopped. Blank = start `serve.py` by hand (binds 127.0.0.1:8000, CPU).
 - Source prompt is filled on txt2img/img2img **🔀 send-to**: `on_ui_tabs` passes the (button,
   gallery) pairs as `send_sources`, wired with `js="extract_image_from_gallery"` and read via
   `images.read_info_from_image`. The send-to `ParamBinding` itself has no `source_tabname`, so

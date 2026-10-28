@@ -14,8 +14,15 @@ the decider lab can load this file by path and drive it with an in-process model
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import re
+import shlex
+import signal
+import subprocess
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Protocol
@@ -175,6 +182,65 @@ class SystemOneHTTP:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 out.append(json.load(resp))
         return out
+
+
+class ServerLauncher:
+    """Starts a local System One server on demand and stops it when this process exits.
+
+    Only a server this launcher started is ever stopped; one already answering is left alone.
+    """
+
+    # Forge's venv must not leak into the server's own environment (e.g. `uv run`).
+    _ENV_DROP = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        atexit.register(self.stop)
+
+    @staticmethod
+    def healthy(base_url: str, timeout: float = 2.0) -> bool:
+        try:
+            with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=timeout):
+                return True
+        except urllib.error.HTTPError:  # it answered (e.g. 401 behind an API key): it is up
+            return True
+        except OSError:
+            return False
+
+    def ensure(self, base_url: str, command: str, wait: float = 180) -> bool:
+        """Make the server at base_url reachable, running command if needed. True if started now."""
+        if self.healthy(base_url):
+            return False
+        if self.proc is None or self.proc.poll() is not None:
+            env = {k: v for k, v in os.environ.items() if k not in self._ENV_DROP}
+            if os.name == "nt":
+                self.proc = subprocess.Popen(command, env=env,
+                                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                self.proc = subprocess.Popen(shlex.split(command), env=env, start_new_session=True)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.healthy(base_url):
+                return True
+            if self.proc.poll() is not None:
+                code, self.proc = self.proc.returncode, None
+                raise RuntimeError(f"server command exited with code {code}")
+            time.sleep(1)
+        raise RuntimeError(f"server not reachable {wait:.0f}s after starting it")
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        # Kill the whole tree: a launcher like `uv run` leaves the real server as a child.
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+
+
+launcher = ServerLauncher()
 
 
 class DecisionModelDecider:
